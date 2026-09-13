@@ -203,6 +203,18 @@ pub struct Process {
     pub hostname: String,
     /// The process ID.
     pub pid: u32,
+    /// Random identifier generated when the storage is created. A container
+    /// restarted in place keeps its hostname and its pid, so this is what tells
+    /// the restarted process apart from the one that died. Empty for records
+    /// written by releases that did not set it.
+    ///
+    /// This identifies one worker runtime rather than one OS process, and must
+    /// stay that way: each runtime owns its own `processing:<id>` list, so a
+    /// process-global identifier would make two runtimes in the same process
+    /// share one list, and the first to shut down would clear the entry while
+    /// the second still has jobs in flight.
+    #[serde(default)]
+    pub instance_id: String,
     /// Last heartbeat timestamp (Unix timestamp).
     pub heartbeat_at: i64,
     /// Process start timestamp (Unix timestamp).
@@ -213,13 +225,44 @@ impl Process {
     /// Returns a unique identifier for the process.
     #[must_use]
     pub fn id(&self) -> String {
-        format!("{}-{}", self.hostname, self.pid)
+        if self.instance_id.is_empty() {
+            // A record written before `instance_id` existed. Unreachable once
+            // every such process has been swept, which a rolling upgrade does
+            // within one dead process threshold; remove this arm in 3.0.
+            format!("{}-{}", self.hostname, self.pid)
+        } else {
+            format!("{}-{}-{}", self.hostname, self.pid, self.instance_id)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::QueueRateStats;
+    use super::{Process, QueueRateStats};
+
+    fn run(instance_id: &str) -> Process {
+        Process {
+            hostname: "host".to_string(),
+            pid: 1,
+            instance_id: instance_id.to_string(),
+            heartbeat_at: 0,
+            started_at: 0,
+        }
+    }
+
+    #[test]
+    fn process_id_tells_apart_two_runs_with_the_same_hostname_and_pid() {
+        assert_eq!(run("a").id(), "host-1-a");
+        assert_ne!(run("a").id(), run("b").id());
+    }
+
+    #[test]
+    fn process_id_of_a_record_without_instance_id_keeps_the_legacy_form() {
+        let recorded_by_an_older_release: Process =
+            serde_json::from_str(r#"{"hostname":"host","pid":1,"heartbeat_at":0,"started_at":0}"#)
+                .expect("a process record without instance_id deserializes");
+        assert_eq!(recorded_by_an_older_release.id(), "host-1");
+    }
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(

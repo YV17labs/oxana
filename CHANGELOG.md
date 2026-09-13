@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Resurrect the jobs of a process that died and restarted in place with the same hostname and pid, as a container restarted by its orchestrator does. The restarted process used to heartbeat under the dead process's identity, so its in-flight jobs were never resurrected while it ran.
+
+### Changed
+
+- `Process` gains an `instance_id` generated when the storage is created, and `Process::id()` becomes `hostname-pid-instance_id`. Records written by earlier releases, which carry no `instance_id`, keep their `hostname-pid` identity, so a rolling upgrade still resurrects their jobs. The new public field is source-breaking for code that builds a `Process` literal; `Process` is otherwise an output type. The Prometheus process labels stay `hostname` and `pid`, so a restart creates no new series.
+
 ## [2.1.5] - 2026-09-10
 
 ### Changed
