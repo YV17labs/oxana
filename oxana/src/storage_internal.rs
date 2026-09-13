@@ -65,6 +65,7 @@ pub(crate) struct StorageInternal {
     stats_pool: Option<deadpool_redis::Pool>,
     keys: StorageKeys,
     started_at: i64,
+    instance_id: String,
     consecutive_redis_failures: Arc<AtomicU32>,
 }
 
@@ -110,6 +111,7 @@ impl StorageInternal {
             stats_pool,
             keys,
             started_at: chrono::Utc::now().timestamp(),
+            instance_id: uuid::Uuid::new_v4().simple().to_string(),
             consecutive_redis_failures: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -1896,6 +1898,7 @@ impl StorageInternal {
         Process {
             hostname,
             pid,
+            instance_id: self.instance_id.clone(),
             heartbeat_at: chrono::Utc::now().timestamp(),
             started_at: self.started_at,
         }
@@ -2106,6 +2109,24 @@ mod tests {
     struct TestJob {}
 
     impl crate::worker::Job for TestJob {}
+
+    /// The dead process threshold the resurrect tests sweep with.
+    const DEAD_PROCESS_THRESHOLD: Duration = Duration::from_secs(5);
+
+    /// Backdates the process's last heartbeat past [`DEAD_PROCESS_THRESHOLD`],
+    /// so the next sweep sees the process as dead.
+    async fn expire_heartbeat(storage: &StorageInternal) -> Result<(), OxanaError> {
+        let mut redis = storage.connection().await?;
+        let _: () = redis
+            .zadd(
+                &storage.keys.processes,
+                storage.current_process().id(),
+                unix_timestamp_secs_f64() - DEAD_PROCESS_THRESHOLD.as_secs_f64() - 1.0,
+            )
+            .await?;
+
+        Ok(())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn polling_waits_before_each_operation_and_finishes_in_flight_work() -> TestResult {
@@ -2506,18 +2527,9 @@ mod tests {
             vec![job_id.unwrap()]
         );
 
-        let mut redis = storage.connection().await?;
+        expire_heartbeat(&storage).await?;
 
-        // fake ping in the past
-        let _: () = redis
-            .zadd(
-                &storage.keys.processes,
-                storage.current_process().id(),
-                unix_timestamp_secs_f64() - 6.0,
-            )
-            .await?;
-
-        storage.resurrect(Duration::from_secs(5)).await?;
+        storage.resurrect(DEAD_PROCESS_THRESHOLD).await?;
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
         assert!(storage.currently_processing_job_ids().await?.is_empty());
@@ -2557,17 +2569,9 @@ mod tests {
             vec![job_id.expect("job_id should be Some")]
         );
 
-        let mut redis = storage.connection().await?;
+        expire_heartbeat(&storage).await?;
 
-        let _: () = redis
-            .zadd(
-                &storage.keys.processes,
-                storage.current_process().id(),
-                unix_timestamp_secs_f64() - 6.0,
-            )
-            .await?;
-
-        storage.resurrect(Duration::from_secs(5)).await?;
+        storage.resurrect(DEAD_PROCESS_THRESHOLD).await?;
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
         assert!(storage.currently_processing_job_ids().await?.is_empty());
@@ -2604,6 +2608,31 @@ mod tests {
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
         assert!(storage.currently_processing_job_ids().await?.is_empty());
+
+        Ok(())
+    }
+
+    /// A container restarted in place keeps its hostname and its pid. The
+    /// restarted process heartbeats before it sweeps, as the runtime does, so a
+    /// job its predecessor was running when it died must still be resurrected.
+    #[tokio::test]
+    async fn test_resurrect_after_restart_with_same_hostname_and_pid() -> TestResult {
+        let pool = redis_pool().await?;
+        let namespace = random_string();
+        let crashed = StorageInternal::new(pool.clone(), Some(namespace.clone()));
+        let queue = random_string();
+        let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
+
+        crashed.enqueue(envelope.clone()).await?;
+        assert_eq!(crashed.dequeue(&queue).await?, Some(envelope.id));
+        expire_heartbeat(&crashed).await?;
+
+        let restarted = StorageInternal::new(pool, Some(namespace));
+        restarted.ping().await?;
+        restarted.resurrect(DEAD_PROCESS_THRESHOLD).await?;
+
+        assert_eq!(restarted.enqueued_count(&queue).await?, 1);
+        assert!(crashed.currently_processing_job_ids().await?.is_empty());
 
         Ok(())
     }

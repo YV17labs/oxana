@@ -222,6 +222,7 @@ mod tests {
             processes: vec![Process {
                 hostname: "test-host".to_string(),
                 pid: 12345,
+                instance_id: "test-instance".to_string(),
                 heartbeat_at: 1700000000,
                 started_at: 1699999000,
             }],
