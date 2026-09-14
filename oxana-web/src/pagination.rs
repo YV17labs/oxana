@@ -8,6 +8,10 @@ pub(crate) struct JobPage {
 }
 
 impl JobPage {
+    pub fn clamp_number(page: usize, total: usize) -> usize {
+        page.clamp(1, total.div_ceil(JOBS_PER_PAGE).max(1))
+    }
+
     pub fn list_opts(page: usize) -> oxana::QueueListOpts {
         oxana::QueueListOpts {
             count: JOBS_PER_PAGE + 1,
@@ -32,5 +36,18 @@ impl JobPage {
 
     pub fn range_end(&self) -> usize {
         ((self.number - 1) * JOBS_PER_PAGE + self.jobs.len()).min(self.total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobPage;
+
+    #[test]
+    fn page_number_tracks_last_available_page_after_deletion() {
+        assert_eq!(JobPage::clamp_number(3, 101), 3);
+        assert_eq!(JobPage::clamp_number(3, 100), 2);
+        assert_eq!(JobPage::clamp_number(3, 0), 1);
+        assert_eq!(JobPage::clamp_number(0, 100), 1);
     }
 }

@@ -157,7 +157,7 @@
                     {% when None %}
                     {% endmatch %}
                     <div class="mt-3 flex justify-end">
-                        <form method="POST" action="{{ base_path }}/queues/{{ queue_key|urlencode }}/jobs/{{ item.job_envelope.id|urlencode_strict }}/delete" onsubmit="return confirmDeleteJob('{{ item.job_envelope.id }}')">
+                        <form method="POST" action="{{ base_path }}/queues/{{ queue_key|urlencode }}/jobs/{{ item.job_envelope.id|urlencode_strict }}/delete?page={{ page.number }}" onsubmit="return confirmDeleteJob('{{ item.job_envelope.id }}')">
                             <button type="submit" class="px-2.5 py-1 rounded bg-red-900/50 border border-red-800 hover:bg-red-800 text-red-300 text-xs transition-colors">Delete Job</button>
                         </form>
                     </div>
@@ -242,7 +242,7 @@
                 {% when None %}
                 {% endmatch %}
                 <div class="mt-3 flex justify-end">
-                    <form method="POST" action="{{ base_path }}/queues/{{ queue_key|urlencode }}/jobs/{{ job.id|urlencode_strict }}/delete" onsubmit="return confirmDeleteJob('{{ job.id }}')">
+                    <form method="POST" action="{{ base_path }}/queues/{{ queue_key|urlencode }}/jobs/{{ job.id|urlencode_strict }}/delete?page={{ page.number }}" onsubmit="return confirmDeleteJob('{{ job.id }}')">
                         <button type="submit" class="px-2.5 py-1 rounded bg-red-900/50 border border-red-800 hover:bg-red-800 text-red-300 text-xs transition-colors">Delete Job</button>
                     </form>
                 </div>
