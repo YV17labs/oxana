@@ -11,9 +11,9 @@ use crate::error::OxanaWebError;
 use crate::pagination::JobPage;
 use crate::templates::{
     BusyTemplate, CronRow, CronTemplate, CronWorkerView, DashboardTemplate, GlobalJobsTemplate,
-    JobDetailTemplate, JobListKind, MetricDetailTemplate, MetricsTemplate, OnDemandJobView,
-    OnDemandQueueView, OnDemandRow, OnDemandTemplate, QueueConcurrencyStatus, QueueDetailTemplate,
-    QueueRuntimeConfigView, QueuesTemplate,
+    JobDetailTemplate, JobListKind, MetricDetailTemplate, MetricsTemplate, OnDemandFormError,
+    OnDemandJobView, OnDemandQueueView, OnDemandRow, OnDemandTemplate, QueueConcurrencyStatus,
+    QueueDetailTemplate, QueueRuntimeConfigView, QueuesTemplate,
 };
 
 const DEFAULT_QUEUE_SORT: &str = "enqueued";
@@ -161,31 +161,42 @@ pub(crate) async fn on_demand_jobs(
         rows,
         queues,
         scheduled: params.scheduled.as_deref() == Some("1"),
-        invalid_json: params.invalid_json.as_deref() == Some("1"),
+        form_error: None,
     }
 }
 
 pub(crate) async fn enqueue_on_demand_job(
     Extension(state): Extension<OxanaWebState>,
     Form(form): Form<OnDemandEnqueueJobForm>,
-) -> Result<Redirect, OxanaWebError> {
+) -> Result<Response, OxanaWebError> {
     let envelope = match on_demand_envelope_from_form(&state.catalog, &form) {
         Ok(envelope) => envelope,
-        Err(oxana::OxanaError::JsonError(_)) => {
-            return Ok(Redirect::to(&format!(
-                "{}/on-demand?invalid_json=1",
-                state.base_path
-            )));
+        Err(oxana::OxanaError::JsonError(error)) => {
+            return Ok((
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                OnDemandTemplate {
+                    base_path: state.base_path,
+                    active_tab: "/on-demand",
+                    rows: build_on_demand_rows(&state.catalog.on_demand_jobs),
+                    queues: build_on_demand_queue_views(&state.catalog.queues),
+                    total: state.catalog.on_demand_jobs.len(),
+                    scheduled: false,
+                    form_error: Some(OnDemandFormError {
+                        name: form.name,
+                        queue: form.queue,
+                        args: form.args,
+                        message: format!("Invalid arguments: {error}"),
+                    }),
+                },
+            )
+                .into_response());
         }
         Err(error) => return Err(error.into()),
     };
 
     state.storage.enqueue_envelope(envelope).await?;
 
-    Ok(Redirect::to(&format!(
-        "{}/on-demand?scheduled=1",
-        state.base_path
-    )))
+    Ok(Redirect::to(&format!("{}/on-demand?scheduled=1", state.base_path)).into_response())
 }
 
 async fn global_jobs(
@@ -286,14 +297,14 @@ pub(crate) async fn queue_detail(
         return Ok(Redirect::to(&format!("{}/queues", state.base_path)).into_response());
     }
 
-    let opts = JobPage::list_opts(params.page);
-
     let stats = state.storage.stats().await?;
     let queue_config = queue_runtime_config_for(&state, &queue_key).await?;
     let live_enqueued = state
         .storage
         .enqueued_count(RawQueue::fixed(queue_key.clone()))
         .await?;
+    let page_number = JobPage::clamp_number(params.page, live_enqueued);
+    let opts = JobPage::list_opts(page_number);
     let queue_stats = queue_detail_queue_stats(&stats, &queue_key, live_enqueued);
     let active_jobs = stats
         .processing
@@ -316,7 +327,7 @@ pub(crate) async fn queue_detail(
         queue_config,
         active_jobs,
         busy,
-        page: JobPage::new(params.page, live_enqueued, jobs),
+        page: JobPage::new(page_number, live_enqueued, jobs),
     }
     .into_response())
 }
@@ -461,14 +472,23 @@ pub(crate) async fn set_queue_concurrency(
 pub(crate) async fn delete_job(
     Extension(state): Extension<OxanaWebState>,
     Path((queue_key, job_id)): Path<(String, String)>,
+    Query(params): Query<DeleteJobParams>,
 ) -> Result<Redirect, OxanaWebError> {
     state.storage.delete_job(&job_id).await?;
 
-    Ok(Redirect::to(&format!(
-        "{}/queues/{}",
-        state.base_path,
-        urlencoding::encode(&queue_key)
-    )))
+    Ok(delete_job_redirect(&state.base_path, &queue_key, &params))
+}
+
+fn delete_job_redirect(base_path: &str, queue_key: &str, params: &DeleteJobParams) -> Redirect {
+    if params.busy {
+        Redirect::to(&format!("{base_path}/busy"))
+    } else {
+        Redirect::to(&format!(
+            "{base_path}/queues/{}?page={}",
+            urlencoding::encode(queue_key),
+            params.page.max(1)
+        ))
+    }
 }
 
 pub(crate) async fn enqueue_job(
@@ -563,6 +583,14 @@ pub(crate) struct PaginationParams {
     page: usize,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct DeleteJobParams {
+    #[serde(default = "default_page")]
+    page: usize,
+    #[serde(default)]
+    busy: bool,
+}
+
 fn default_page() -> usize {
     1
 }
@@ -626,8 +654,6 @@ pub(crate) struct QueueConcurrencyForm {
 pub(crate) struct OnDemandParams {
     #[serde(default)]
     scheduled: Option<String>,
-    #[serde(default)]
-    invalid_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1899,30 +1925,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_demand_enqueue_redirects_after_invalid_json() {
-        let storage = oxana::Storage::builder()
-            .build_from_redis_url("redis://127.0.0.1/0")
-            .expect("test storage pool should build");
-        let state = OxanaWebState::new(storage, on_demand_catalog(), "/admin".to_string());
+    async fn on_demand_enqueue_preserves_input_after_invalid_arguments() {
+        for args in [
+            "{",
+            r#"{"id":"not a number","payload":"</textarea><script>alert(1)</script>"}"#,
+        ] {
+            let storage = oxana::Storage::builder()
+                .build_from_redis_url("redis://127.0.0.1/0")
+                .expect("test storage pool should build");
+            let mut catalog = on_demand_catalog();
+            catalog.queues.push(queue_info("alternate", false));
+            let state = OxanaWebState::new(storage, catalog, "/admin".to_string());
 
-        let redirect = enqueue_on_demand_job(
-            Extension(state),
-            Form(OnDemandEnqueueJobForm {
-                queue: "default".to_string(),
-                name: std::any::type_name::<OnDemandJob>().to_string(),
-                args: "{".to_string(),
-            }),
-        )
-        .await
-        .expect("invalid JSON should redirect back to on-demand");
+            let response = enqueue_on_demand_job(
+                Extension(state),
+                Form(OnDemandEnqueueJobForm {
+                    queue: "alternate".to_string(),
+                    name: std::any::type_name::<OnDemandJob>().to_string(),
+                    args: args.to_string(),
+                }),
+            )
+            .await
+            .expect("invalid arguments should render the submitted form");
 
-        let response = redirect.into_response();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(!response.headers().contains_key(header::LOCATION));
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("Invalid arguments:"));
+            assert!(html.contains("<option value=\"alternate\" selected>alternate</option>"));
+            assert!(html.contains("aria-invalid=\"true\""));
+            assert!(html.contains("open>"));
+            assert!(!html.contains("</textarea><script>alert(1)</script>"));
+            if args == "{" {
+                assert!(html.contains(">{</textarea>"));
+            } else {
+                assert!(html.contains("not a number"));
+                assert!(html.contains("alert(1)"));
+            }
+        }
+    }
 
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            response.headers().get(header::LOCATION).unwrap(),
-            "/admin/on-demand?invalid_json=1"
-        );
+    #[test]
+    fn delete_job_returns_to_source_page() {
+        for (page, busy, expected) in [
+            (3, false, "/admin/queues/tenant%23acme?page=3"),
+            (0, false, "/admin/queues/tenant%23acme?page=1"),
+            (3, true, "/admin/busy"),
+        ] {
+            let response = super::delete_job_redirect(
+                "/admin",
+                "tenant#acme",
+                &super::DeleteJobParams { page, busy },
+            )
+            .into_response();
+            assert_eq!(response.headers()[header::LOCATION], expected);
+        }
     }
 
     #[test]

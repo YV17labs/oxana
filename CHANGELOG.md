@@ -4,8 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add quick name filters to the dashboard's Queues, Cron, and On-Demand pages, keeping matching group headings visible.
+- Add inline JSON validation and a Format JSON button to on-demand job forms, preserving large numeric IDs when formatting.
+
 ### Fixed
 
+- Keep the current page after deleting or reviving dashboard jobs, return deletions from Busy to Busy, and show the last populated queue page when deletion empties the final page.
+- Preserve submitted arguments and queue selection when on-demand job validation fails, with an inline error and the form kept open.
 - Enforce one shutdown deadline across all queues and background tasks. At expiry, cancel and join remaining workers, including batch jobs, while retaining interrupted jobs for resurrection. Keep heartbeats alive during graceful draining and stop them after execution stops. Preserve the initiating runtime error; an ordinary shutdown signal that exceeds the deadline returns `OxanaError::ShutdownTimeout`.
 
 ## [2.1.7] - 2026-09-14

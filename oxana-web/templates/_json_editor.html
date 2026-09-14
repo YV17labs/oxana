@@ -1,0 +1,59 @@
+<script>
+    // Preserve number tokens: parsing and stringifying would round large job IDs.
+    function formatJson(source) {
+        const tokens = source.match(/"(?:\\.|[^"\\])*"|[{}\[\],:]|[^\s{}\[\],:]+/g);
+        let result = '';
+        let depth = 0;
+        const newline = () => '\n' + '  '.repeat(depth);
+        for (let index = 0; index < tokens.length; index++) {
+            const token = tokens[index];
+            if (token === '{' || token === '[') {
+                result += token;
+                if (tokens[index + 1] === (token === '{' ? '}' : ']')) {
+                    result += tokens[++index];
+                } else {
+                    depth++;
+                    result += newline();
+                }
+            } else if (token === '}' || token === ']') {
+                depth--;
+                result += newline() + token;
+            } else if (token === ',') {
+                result += token + newline();
+            } else {
+                result += token === ':' ? ': ' : token;
+            }
+        }
+        return result;
+    }
+
+    for (const form of document.querySelectorAll('[data-json-editor]')) {
+        const args = form.elements.args;
+        const error = form.querySelector('[data-json-error]');
+        function validate() {
+            try {
+                JSON.parse(args.value);
+                error.textContent = '';
+                error.hidden = true;
+                args.removeAttribute('aria-invalid');
+                return true;
+            } catch (failure) {
+                error.textContent = `Invalid JSON: ${failure.message}`;
+                error.hidden = false;
+                args.setAttribute('aria-invalid', 'true');
+                args.focus();
+                return false;
+            }
+        }
+        args.addEventListener('input', () => {
+            error.hidden = true;
+            args.removeAttribute('aria-invalid');
+        });
+        form.addEventListener('submit', event => {
+            if (!validate()) event.preventDefault();
+        });
+        form.querySelector('[data-format-json]').addEventListener('click', () => {
+            if (validate()) args.value = formatJson(args.value);
+        });
+    }
+</script>

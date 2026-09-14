@@ -27,6 +27,8 @@
             No cron workers registered
         </div>
         {% else %}
+        {% let filter_label = "Filter workers" %}
+        {% include "_list_filter.html" %}
         <div class="overflow-x-auto">
             <table class="w-full text-sm">
                 <thead>
@@ -41,12 +43,12 @@
                 <tbody>
                     {% for row in &rows %}
                     {% match row %}
-                    {% when CronRow::Group { name, depth: _ } %}
-                    <tr class="border-b border-gray-800/50">
+                    {% when CronRow::Group { name, depth } %}
+                    <tr data-filter-depth="{{ depth }}" data-filter-group class="border-b border-gray-800/50">
                         <td colspan="5" class="py-2 pt-4 font-mono text-xs text-gray-500 font-semibold" style="padding-left: {{ row.indent_px() }}px">{{ name }}</td>
                     </tr>
-                    {% when CronRow::Worker { view: cw, depth: _ } %}
-                    <tr class="border-b border-gray-800/50 hover:bg-gray-900/50">
+                    {% when CronRow::Worker { view: cw, depth } %}
+                    <tr data-filter-depth="{{ depth }}" data-filter-text="{{ cw.name }} {{ cw.queue_key }}" class="border-b border-gray-800/50 hover:bg-gray-900/50">
                         <td class="py-3 pr-4 font-mono text-sm" style="padding-left: {{ row.indent_px() }}px"><span class="text-gray-600">&#8627; </span>{{ cw.short_name }}</td>
                         <td class="py-3 pr-4 font-mono text-sm text-gray-400">{{ cw.queue_key }}</td>
                         <td class="py-3 pr-4 font-mono text-sm text-yellow-400">{{ cw.schedule }}</td>
@@ -66,5 +68,6 @@
         {% endif %}
     </div>
     {% include "_auto_dismiss_notices.html" %}
+    {% include "_list_filter_script.html" %}
 </body>
 </html>

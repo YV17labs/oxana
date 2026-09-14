@@ -1,0 +1,28 @@
+<script>
+    (() => {
+        const input = document.getElementById('list-filter');
+        if (!input) return;
+        const rows = Array.from(document.querySelectorAll('[data-filter-depth]'));
+        const total = rows.filter(row => row.hasAttribute('data-filter-text')).length;
+        function filterRows() {
+            const query = input.value.trim().toLowerCase();
+            const groups = [];
+            let matches = 0;
+            for (const row of rows) {
+                const depth = Number(row.dataset.filterDepth);
+                while (groups.length && groups[groups.length - 1].depth >= depth) groups.pop();
+                const matchesQuery = row.hasAttribute('data-filter-text') && row.dataset.filterText.toLowerCase().includes(query);
+                row.hidden = !matchesQuery;
+                if (matchesQuery) {
+                    matches++;
+                    for (const group of groups) group.row.hidden = false;
+                }
+                if (row.hasAttribute('data-filter-group')) groups.push({ row, depth });
+            }
+            document.getElementById('filter-count').textContent = query ? `${matches} of ${total} shown` : '';
+            document.getElementById('filter-empty').hidden = matches > 0;
+        }
+        input.addEventListener('input', filterRows);
+        filterRows();
+    })();
+</script>

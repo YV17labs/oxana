@@ -899,7 +899,40 @@ pub(crate) struct OnDemandTemplate {
     pub queues: Vec<OnDemandQueueView>,
     pub total: usize,
     pub scheduled: bool,
-    pub invalid_json: bool,
+    pub form_error: Option<OnDemandFormError>,
+}
+
+pub(crate) struct OnDemandFormError {
+    pub name: String,
+    pub queue: String,
+    pub args: String,
+    pub message: String,
+}
+
+impl OnDemandTemplate {
+    fn submitted_for(&self, job: &OnDemandJobView) -> Option<&OnDemandFormError> {
+        self.form_error
+            .as_ref()
+            .filter(|form| form.name == job.name)
+    }
+
+    fn has_error(&self, job: &OnDemandJobView) -> bool {
+        self.submitted_for(job).is_some()
+    }
+
+    fn args_for<'a>(&'a self, job: &'a OnDemandJobView) -> &'a str {
+        self.submitted_for(job)
+            .map_or(&job.args_template_json, |form| &form.args)
+    }
+
+    fn error_for(&self, job: &OnDemandJobView) -> &str {
+        self.submitted_for(job).map_or("", |form| &form.message)
+    }
+
+    fn queue_selected(&self, job: &OnDemandJobView, queue: &OnDemandQueueView) -> bool {
+        self.submitted_for(job)
+            .map_or(queue.selected, |form| form.queue == queue.key)
+    }
 }
 
 #[derive(Template, WebTemplate)]
@@ -1094,6 +1127,9 @@ mod job_card_tests {
             assert!(rendered.contains("href=\"?page=1\""));
             assert!(rendered.contains("href=\"?page=3\""));
             assert!(rendered.contains("51&ndash;100 of 101"));
+            if template.kind.is_dead() {
+                assert!(rendered.contains("name=\"redirect\" value=\"/dead?page=2\""));
+            }
         }
     }
 
@@ -1308,7 +1344,7 @@ mod on_demand_tests {
             }],
             total: 0,
             scheduled: false,
-            invalid_json: false,
+            form_error: None,
         };
 
         let rendered = template.render().unwrap();
@@ -1332,7 +1368,7 @@ mod on_demand_tests {
             queues: Vec::new(),
             total: 1,
             scheduled: false,
-            invalid_json: false,
+            form_error: None,
         };
 
         let rendered = template.render().unwrap();
@@ -1365,7 +1401,7 @@ mod on_demand_tests {
             }],
             total: 1,
             scheduled: false,
-            invalid_json: false,
+            form_error: None,
         };
 
         let rendered = template.render().unwrap();
@@ -1386,30 +1422,12 @@ mod on_demand_tests {
             queues: Vec::new(),
             total: 0,
             scheduled: true,
-            invalid_json: false,
+            form_error: None,
         };
 
         let rendered = template.render().unwrap();
 
         assert!(rendered.contains("Job scheduled."));
-        assert!(rendered.contains("data-auto-dismiss-notice"));
-    }
-
-    #[test]
-    fn on_demand_template_shows_notice_after_invalid_json() {
-        let template = OnDemandTemplate {
-            base_path: "/admin".to_string(),
-            active_tab: "/on-demand",
-            rows: Vec::new(),
-            queues: Vec::new(),
-            total: 0,
-            scheduled: false,
-            invalid_json: true,
-        };
-
-        let rendered = template.render().unwrap();
-
-        assert!(rendered.contains("Invalid JSON."));
         assert!(rendered.contains("data-auto-dismiss-notice"));
     }
 }

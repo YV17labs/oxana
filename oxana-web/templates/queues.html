@@ -45,6 +45,8 @@
             No queues
         </div>
         {% else %}
+        {% let filter_label = "Filter queues" %}
+        {% include "_list_filter.html" %}
         <div class="overflow-x-auto">
             <table class="w-full text-sm">
                 <thead>
@@ -64,7 +66,7 @@
                 </thead>
                 <tbody>
                     {% for queue in &stats.queues %}
-                    <tr class="border-b border-gray-800/50 hover:bg-gray-900/50">
+                    <tr data-filter-depth="0" data-filter-group data-filter-text="{{ queue.key }}" class="border-b border-gray-800/50 hover:bg-gray-900/50">
                         <td class="py-3 pr-4 font-mono text-sm">{% if queue.queues.is_empty() %}<a href="{{ base_path }}/queues/{{ queue.key|urlencode }}" class="text-blue-400 hover:text-blue-300 hover:underline">{{ queue.key }}</a>{% else %}{{ queue.key }}{% endif %}</td>
                         <td class="py-3 pr-4 text-right text-gray-300">{{ self.concurrency_for(&queue.key) }}{% if self.has_concurrency_override_for(&queue.key) %} <span class="text-gray-500">(<span class="line-through">{{ self.default_concurrency_for(&queue.key) }}</span>)</span>{% endif %}</td>
                         <td class="py-3 pr-4 text-right {{ self.state_class_for(&queue.key) }}">{{ self.state_for(&queue.key) }}</td>
@@ -79,7 +81,7 @@
                     </tr>
                     {% for dq in &queue.queues %}
                     {% let dq_key = self.dynamic_queue_key(&queue.key, &dq.suffix) %}
-                    <tr class="border-b border-gray-800/50 hover:bg-gray-900/50 text-gray-500">
+                    <tr data-filter-depth="1" data-filter-text="{{ dq_key }}" class="border-b border-gray-800/50 hover:bg-gray-900/50 text-gray-500">
                         <td class="py-2 pr-4 pl-10 font-mono text-xs">&#8627; <a href="{{ base_path }}/queues/{{ queue.key }}%23{{ dq.suffix|urlencode }}" class="text-blue-400 hover:text-blue-300 hover:underline">{{ dq.suffix }}</a></td>
                         <td class="py-2 pr-4 text-right text-xs text-gray-400">{{ self.concurrency_for(&dq_key) }}{% if self.has_concurrency_override_for(&dq_key) %} <span class="text-gray-600">(<span class="line-through">{{ self.default_concurrency_for(&dq_key) }}</span>)</span>{% endif %}</td>
                         <td class="py-2 pr-4 text-right text-xs {{ self.state_class_for(&dq_key) }}">{{ self.state_for(&dq_key) }}</td>
@@ -112,5 +114,6 @@
             });
         });
     </script>
+    {% include "_list_filter_script.html" %}
 </body>
 </html>
