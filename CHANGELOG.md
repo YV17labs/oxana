@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.8] - 2026-09-14
+
 ### Added
 
 - Add quick name filters to the dashboard's Queues, Cron, and On-Demand pages, keeping matching group headings visible.
