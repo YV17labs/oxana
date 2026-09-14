@@ -116,6 +116,15 @@ impl StorageInternal {
         }
     }
 
+    /// Shares the pools and namespace with a new process identity.
+    pub fn for_new_process(&self) -> Self {
+        Self::with_optional_stats_pool(
+            self.pool.clone(),
+            self.stats_pool.clone(),
+            Some(self.keys.namespace.clone()),
+        )
+    }
+
     fn record_redis_success(&self) {
         if self.consecutive_redis_failures.load(Ordering::Relaxed) != 0 {
             self.consecutive_redis_failures.store(0, Ordering::Relaxed);
