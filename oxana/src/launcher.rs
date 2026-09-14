@@ -210,7 +210,7 @@ where
         .get_or_try_init(|| {
             runtime.storage.internal.register(
                 &runtime.cancel_token,
-                runtime.settings.resurrect_scan_interval,
+                runtime.settings.heartbeat_interval,
                 runtime.settings.redis_failure_tolerance,
             )
         })
