@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Never sweep a process that is alive and heartbeating. A sweep read the process set before scanning for processing lists, so a replica that registered and claimed a job while that scan ran was absent from the snapshot and taken for dead: its job went back on the queue and ran a second time, concurrently. Processing lists missing from the snapshot are now re-checked against the process set after the scan, and each coordinator waits for its first successful ping before claiming a job, so a processing list never exists without its process record.
+
 ## [2.1.6] - 2026-09-14
 
 ### Fixed

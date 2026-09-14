@@ -1660,25 +1660,40 @@ impl StorageInternal {
     ) -> Result<(), OxanaError> {
         tracing::info!("Starting resurrect loop");
 
-        // Route the initial ping through the failure tolerance so a transient
-        // Redis error at startup does not abort the whole runtime.
-        loop {
-            if cancel_token.is_cancelled() {
-                return Ok(());
-            }
-            if self
-                .track_redis_result(self.ping().await, failure_tolerance)?
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(scan_interval).await;
+        if !self
+            .register(&cancel_token, scan_interval, failure_tolerance)
+            .await?
+        {
+            return Ok(());
         }
 
         self.poll_redis(cancel_token, scan_interval, failure_tolerance, || {
             self.resurrect(dead_process_threshold)
         })
         .await
+    }
+
+    /// Pings until a ping lands, routing each failure through the failure
+    /// tolerance so a transient Redis error at startup does not abort the whole
+    /// runtime. Returns `false` when cancelled first.
+    pub async fn register(
+        &self,
+        cancel_token: &CancellationToken,
+        retry_interval: Duration,
+        failure_tolerance: u32,
+    ) -> Result<bool, OxanaError> {
+        loop {
+            if cancel_token.is_cancelled() {
+                return Ok(false);
+            }
+            if self
+                .track_redis_result(self.ping().await, failure_tolerance)?
+                .is_some()
+            {
+                return Ok(true);
+            }
+            tokio::time::sleep(retry_interval).await;
+        }
     }
 
     pub async fn cron_job_loop<F>(
@@ -2061,6 +2076,17 @@ impl StorageInternal {
             .zrange_withscores(&self.keys.processes, 0, -1)
             .await?;
 
+        self.dead_process_ids_from(redis, process_ids, dead_process_threshold)
+            .await
+    }
+
+    /// Dead processes, given the process set as it was read before the scan.
+    async fn dead_process_ids_from(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        process_ids: Vec<(String, f64)>,
+        dead_process_threshold: Duration,
+    ) -> Result<Vec<String>, OxanaError> {
         let active_process_ids: HashSet<String> =
             process_ids.iter().map(|(id, _)| id.clone()).collect();
         let mut dead_process_ids = Vec::new();
@@ -2077,13 +2103,31 @@ impl StorageInternal {
             .scan_keys_w_conn(redis, &format!("{}:*", self.keys.processing_queue_prefix))
             .await?;
 
-        for processing_queue in all_processing_queues {
-            let process_id = match processing_queue.rsplit(':').next() {
-                Some(process_id) => process_id.to_string(),
-                None => continue,
-            };
+        let unregistered: Vec<String> = all_processing_queues
+            .iter()
+            .filter_map(|processing_queue| processing_queue.rsplit(':').next())
+            .filter(|process_id| !active_process_ids.contains(*process_id))
+            .map(str::to_string)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
 
-            if !active_process_ids.contains(&process_id) && seen_dead.insert(process_id.clone()) {
+        if unregistered.is_empty() {
+            return Ok(dead_process_ids);
+        }
+
+        // The process set was read before the scan, and a scan over a large
+        // keyspace takes a while: a process that registered and claimed a job
+        // meanwhile has a processing list and no entry in that snapshot. Only a
+        // process still unregistered now is dead.
+        let mut pipe = redis::pipe();
+        for process_id in &unregistered {
+            pipe.zscore(&self.keys.processes, process_id);
+        }
+        let scores: Vec<Option<f64>> = pipe.query_async(&mut *redis).await?;
+
+        for (process_id, score) in unregistered.into_iter().zip(scores) {
+            if score.is_none() && seen_dead.insert(process_id.clone()) {
                 dead_process_ids.push(process_id);
             }
         }
@@ -2633,6 +2677,38 @@ mod tests {
 
         assert_eq!(restarted.enqueued_count(&queue).await?, 1);
         assert!(crashed.currently_processing_job_ids().await?.is_empty());
+
+        Ok(())
+    }
+
+    /// A sweep reads the process set before it scans for processing lists. A
+    /// process that registers and claims a job while that scan runs is alive,
+    /// and its job must stay where it is.
+    #[tokio::test]
+    async fn test_a_process_registered_during_the_scan_is_not_dead() -> TestResult {
+        let pool = redis_pool().await?;
+        let namespace = random_string();
+        let peer = StorageInternal::new(pool.clone(), Some(namespace.clone()));
+        let queue = random_string();
+        let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
+        peer.enqueue(envelope.clone()).await?;
+
+        let mut redis = peer.connection().await?;
+        let snapshot: Vec<(String, f64)> =
+            redis.zrange_withscores(&peer.keys.processes, 0, -1).await?;
+
+        let started = StorageInternal::new(pool, Some(namespace));
+        started.ping().await?;
+        assert_eq!(started.dequeue(&queue).await?, Some(envelope.id));
+
+        let dead = peer
+            .dead_process_ids_from(&mut redis, snapshot, DEAD_PROCESS_THRESHOLD)
+            .await?;
+
+        assert!(
+            !dead.contains(&started.current_process().id()),
+            "a process registered after the snapshot was taken for dead: {dead:?}"
+        );
 
         Ok(())
     }

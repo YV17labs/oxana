@@ -42,12 +42,28 @@ where
         if !runtime.settings.runs_queue(queue_config) {
             continue;
         }
-        coordinator_joinset.spawn(coordinator::run(
-            Arc::clone(&runtime),
-            Arc::clone(&stats),
-            ctx.clone(),
-            queue_config.clone(),
-        ));
+        let runtime = Arc::clone(&runtime);
+        let stats = Arc::clone(&stats);
+        let ctx = ctx.clone();
+        let queue_config = queue_config.clone();
+        coordinator_joinset.spawn(async move {
+            // Claim nothing before this process is registered: a peer's sweep
+            // takes a processing list with no process record for a dead
+            // process's, and would put the job back on the queue while it runs.
+            if !runtime
+                .storage
+                .internal
+                .register(
+                    &runtime.cancel_token,
+                    runtime.settings.heartbeat_interval,
+                    runtime.settings.redis_failure_tolerance,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            coordinator::run(runtime, stats, ctx, queue_config).await
+        });
     }
 
     let mut result = Ok(());
