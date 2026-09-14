@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Never sweep a process that is alive and heartbeating. A sweep read the process set before scanning for processing lists, and the scan grows with the keyspace: a replica that registered and claimed a job while it ran was missing from that earlier read and taken for dead, so its job went back on the queue and ran a second time, concurrently. The process set is now read after the scan, and the runtime registers before it claims, so a processing list never exists without its process record.
-- Register the draining process while `RuntimeBuilder::drain` runs. `drain` claimed jobs without ever writing a process record, so its processing list looked like a dead process's to any worker sweeping the same namespace: the worker put the job back on its queue and ran it while the drain was still running it. `drain` now registers before it claims, heartbeats for as long as jobs run, and drops its record when it returns.
+- Register each `RuntimeBuilder::drain` call with its own process identity and heartbeat so worker sweeps cannot resurrect jobs that are still running. Finishing a drain preserves other runtimes' records, and cancelling a drain stops its heartbeat so abandoned jobs can be recovered.
 
 ## [2.1.6] - 2026-09-14
 

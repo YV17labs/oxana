@@ -48,6 +48,10 @@ where
     DT: Send + Sync + Clone + 'static,
 {
     let queue_key = queue.key();
+    // Each drain owns its process record and processing list, even when other
+    // drains or runtimes use clones of the caller's storage.
+    let mut storage = storage.clone();
+    storage.internal = storage.internal.for_new_process();
 
     // Claim nothing before this process is registered, and keep heartbeating
     // for as long as jobs run. A processing list whose process has no record —
@@ -57,6 +61,8 @@ where
     storage.internal.ping().await?;
 
     let heartbeat_cancel = CancellationToken::new();
+    // Cancel the heartbeat even if the drain future is dropped or panics.
+    let _heartbeat_guard = heartbeat_cancel.clone().drop_guard();
     let heartbeat = tokio::spawn({
         let storage = storage.clone();
         let cancel_token = heartbeat_cancel.clone();
@@ -70,7 +76,7 @@ where
         }
     });
 
-    let stats = drain_queue(storage, config, settings, ctx, &queue_key).await;
+    let stats = drain_queue(&storage, config, settings, ctx, &queue_key).await;
 
     heartbeat_cancel.cancel();
     if let Err(e) = heartbeat.await {
