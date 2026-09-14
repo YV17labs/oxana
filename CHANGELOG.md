@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforce one shutdown deadline across all queues and background tasks. At expiry, cancel and join remaining workers, including batch jobs, while retaining interrupted jobs for resurrection. Keep heartbeats alive during graceful draining and stop them after execution stops. Preserve the initiating runtime error; an ordinary shutdown signal that exceeds the deadline returns `OxanaError::ShutdownTimeout`.
+
 ## [2.1.7] - 2026-09-14
 
 ### Fixed

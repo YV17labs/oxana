@@ -34,10 +34,19 @@ where
                 match config.storage.internal.track_redis_result(result, config.settings.redis_failure_tolerance)? {
                     Some(Some(job_id)) => {
                         let job = WorkerJob { job_id, permit };
-                        job_tx
-                            .send(job)
-                            .await
-                            .expect("Failed to send job to worker");
+                        tokio::select! {
+                            _ = config.cancel_token.cancelled() => break,
+                            result = job_tx.send(job) => {
+                                if result.is_err() {
+                                    if config.cancel_token.is_cancelled() {
+                                        break;
+                                    }
+                                    return Err(crate::OxanaError::GenericError(
+                                        "Job receiver closed unexpectedly".to_string(),
+                                    ));
+                                }
+                            }
+                        }
                     }
                     Some(None) => {
                         drop(permit);

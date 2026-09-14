@@ -1,6 +1,8 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum OxanaError {
+    #[error("Shutdown timeout reached; remaining tasks were cancelled")]
+    ShutdownTimeout,
     #[error("Generic error: {0}")]
     GenericError(String),
     #[error("Job not found")]
