@@ -433,6 +433,10 @@ pub(crate) struct Runtime<DT> {
     pub(crate) settings: RuntimeSettings,
     pub(crate) storage: Storage,
     pub(crate) cancel_token: CancellationToken,
+    /// Whether the first ping landed, so that every task needing this process
+    /// to be registered waits on one registration instead of racing its own.
+    /// `false` once cancelled before it did.
+    pub(crate) registered: tokio::sync::OnceCell<bool>,
 }
 
 impl<DT> Runtime<DT> {
@@ -442,6 +446,7 @@ impl<DT> Runtime<DT> {
             settings,
             storage,
             cancel_token: CancellationToken::new(),
+            registered: tokio::sync::OnceCell::new(),
         }
     }
 }
