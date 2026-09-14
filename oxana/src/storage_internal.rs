@@ -1660,13 +1660,6 @@ impl StorageInternal {
     ) -> Result<(), OxanaError> {
         tracing::info!("Starting resurrect loop");
 
-        if !self
-            .register(&cancel_token, scan_interval, failure_tolerance)
-            .await?
-        {
-            return Ok(());
-        }
-
         self.poll_redis(cancel_token, scan_interval, failure_tolerance, || {
             self.resurrect(dead_process_threshold)
         })
@@ -1692,7 +1685,10 @@ impl StorageInternal {
             {
                 return Ok(true);
             }
-            tokio::time::sleep(retry_interval).await;
+            tokio::select! {
+                () = tokio::time::sleep(retry_interval) => {}
+                () = cancel_token.cancelled() => return Ok(false),
+            }
         }
     }
 
@@ -2072,63 +2068,54 @@ impl StorageInternal {
         redis: &mut deadpool_redis::Connection,
         dead_process_threshold: Duration,
     ) -> Result<Vec<String>, OxanaError> {
-        let process_ids: Vec<(String, f64)> = (*redis)
-            .zrange_withscores(&self.keys.processes, 0, -1)
-            .await?;
-
-        self.dead_process_ids_from(redis, process_ids, dead_process_threshold)
-            .await
-    }
-
-    /// Dead processes, given the process set as it was read before the scan.
-    async fn dead_process_ids_from(
-        &self,
-        redis: &mut deadpool_redis::Connection,
-        process_ids: Vec<(String, f64)>,
-        dead_process_threshold: Duration,
-    ) -> Result<Vec<String>, OxanaError> {
-        let active_process_ids: HashSet<String> =
-            process_ids.iter().map(|(id, _)| id.clone()).collect();
-        let mut dead_process_ids = Vec::new();
-        let mut seen_dead = HashSet::new();
-        let threshold = unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64();
-
-        for (process_id, score) in process_ids {
-            if score < threshold && seen_dead.insert(process_id.clone()) {
-                dead_process_ids.push(process_id);
-            }
-        }
-
         let all_processing_queues = self
             .scan_keys_w_conn(redis, &format!("{}:*", self.keys.processing_queue_prefix))
             .await?;
 
-        let unregistered: Vec<String> = all_processing_queues
-            .iter()
-            .filter_map(|processing_queue| processing_queue.rsplit(':').next())
-            .filter(|process_id| !active_process_ids.contains(*process_id))
-            .map(str::to_string)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
+        self.dead_process_ids_in(redis, &all_processing_queues, dead_process_threshold)
+            .await
+    }
 
-        if unregistered.is_empty() {
-            return Ok(dead_process_ids);
+    /// Dead processes among the given processing lists, reading the process set
+    /// now, after the scan that produced them.
+    ///
+    /// The scan grows with the keyspace, so a process set read before it goes
+    /// stale while it runs: a process that registers and claims a job meanwhile
+    /// holds a processing list that the earlier read cannot account for, and a
+    /// process that heartbeats meanwhile still carries its earlier score. Both
+    /// would be swept while alive, and their jobs would run a second time,
+    /// concurrently. Reading the set afterwards leaves no such window, since a
+    /// process registers before it claims (see `launcher::register`).
+    async fn dead_process_ids_in(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        all_processing_queues: &HashSet<String>,
+        dead_process_threshold: Duration,
+    ) -> Result<Vec<String>, OxanaError> {
+        let process_ids: Vec<(String, f64)> = (*redis)
+            .zrange_withscores(&self.keys.processes, 0, -1)
+            .await?;
+
+        let threshold = unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64();
+        let mut active_process_ids = HashSet::with_capacity(process_ids.len());
+        let mut dead_process_ids = Vec::new();
+
+        // A zset member is returned once, and the loop below only reports ids
+        // absent from the set, so no id can be reported twice.
+        for (process_id, score) in process_ids {
+            if score < threshold {
+                dead_process_ids.push(process_id.clone());
+            }
+            active_process_ids.insert(process_id);
         }
 
-        // The process set was read before the scan, and a scan over a large
-        // keyspace takes a while: a process that registered and claimed a job
-        // meanwhile has a processing list and no entry in that snapshot. Only a
-        // process still unregistered now is dead.
-        let mut pipe = redis::pipe();
-        for process_id in &unregistered {
-            pipe.zscore(&self.keys.processes, process_id);
-        }
-        let scores: Vec<Option<f64>> = pipe.query_async(&mut *redis).await?;
+        for processing_queue in all_processing_queues {
+            let Some(process_id) = processing_queue.rsplit(':').next() else {
+                continue;
+            };
 
-        for (process_id, score) in unregistered.into_iter().zip(scores) {
-            if score.is_none() && seen_dead.insert(process_id.clone()) {
-                dead_process_ids.push(process_id);
+            if !active_process_ids.contains(process_id) {
+                dead_process_ids.push(process_id.to_string());
             }
         }
 
@@ -2681,11 +2668,11 @@ mod tests {
         Ok(())
     }
 
-    /// A sweep reads the process set before it scans for processing lists. A
-    /// process that registers and claims a job while that scan runs is alive,
-    /// and its job must stay where it is.
+    /// The process set is read after the scan, not before. A process that
+    /// registers while the scan runs is alive, and the processing list the scan
+    /// found for it must not be swept.
     #[tokio::test]
-    async fn test_a_process_registered_during_the_scan_is_not_dead() -> TestResult {
+    async fn test_a_process_registered_after_the_scan_is_not_dead() -> TestResult {
         let pool = redis_pool().await?;
         let namespace = random_string();
         let peer = StorageInternal::new(pool.clone(), Some(namespace.clone()));
@@ -2693,21 +2680,21 @@ mod tests {
         let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
         peer.enqueue(envelope.clone()).await?;
 
-        let mut redis = peer.connection().await?;
-        let snapshot: Vec<(String, f64)> =
-            redis.zrange_withscores(&peer.keys.processes, 0, -1).await?;
-
+        // Claims first and registers second, as it would halfway through a scan.
         let started = StorageInternal::new(pool, Some(namespace));
-        started.ping().await?;
         assert_eq!(started.dequeue(&queue).await?, Some(envelope.id));
 
+        let scanned = HashSet::from([started.current_processing_queue()]);
+        started.ping().await?;
+
+        let mut redis = peer.connection().await?;
         let dead = peer
-            .dead_process_ids_from(&mut redis, snapshot, DEAD_PROCESS_THRESHOLD)
+            .dead_process_ids_in(&mut redis, &scanned, DEAD_PROCESS_THRESHOLD)
             .await?;
 
         assert!(
             !dead.contains(&started.current_process().id()),
-            "a process registered after the snapshot was taken for dead: {dead:?}"
+            "a process that registered after the scan was taken for dead: {dead:?}"
         );
 
         Ok(())

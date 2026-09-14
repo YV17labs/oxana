@@ -7,6 +7,7 @@ use crate::config::{Config, RuntimeSettings};
 use crate::context::ContextValue;
 use crate::coordinator;
 use crate::error::OxanaError;
+use crate::queue::QueueConfig;
 use crate::result_collector::Stats;
 use crate::runtime::Runtime;
 use crate::storage::Storage;
@@ -42,28 +43,12 @@ where
         if !runtime.settings.runs_queue(queue_config) {
             continue;
         }
-        let runtime = Arc::clone(&runtime);
-        let stats = Arc::clone(&stats);
-        let ctx = ctx.clone();
-        let queue_config = queue_config.clone();
-        coordinator_joinset.spawn(async move {
-            // Claim nothing before this process is registered: a peer's sweep
-            // takes a processing list with no process record for a dead
-            // process's, and would put the job back on the queue while it runs.
-            if !runtime
-                .storage
-                .internal
-                .register(
-                    &runtime.cancel_token,
-                    runtime.settings.heartbeat_interval,
-                    runtime.settings.redis_failure_tolerance,
-                )
-                .await?
-            {
-                return Ok(());
-            }
-            coordinator::run(runtime, stats, ctx, queue_config).await
-        });
+        coordinator_joinset.spawn(coordinator_loop(
+            Arc::clone(&runtime),
+            Arc::clone(&stats),
+            ctx.clone(),
+            queue_config.clone(),
+        ));
     }
 
     let mut result = Ok(());
@@ -210,10 +195,62 @@ where
     Ok(())
 }
 
+/// Registers this process, once for the whole runtime.
+///
+/// Returns `false` when the runtime was cancelled before a ping landed. Every
+/// task that must not act before the process is registered awaits this, so a
+/// Redis outage at startup is retried by one task rather than by each of them,
+/// which would burn the shared failure tolerance that much faster.
+async fn register<DT>(runtime: &Runtime<DT>) -> Result<bool, OxanaError>
+where
+    DT: Send + Sync + Clone + 'static,
+{
+    runtime
+        .registered
+        .get_or_try_init(|| {
+            runtime.storage.internal.register(
+                &runtime.cancel_token,
+                runtime.settings.resurrect_scan_interval,
+                runtime.settings.redis_failure_tolerance,
+            )
+        })
+        .await
+        .copied()
+}
+
+async fn coordinator_loop<DT>(
+    runtime: Arc<Runtime<DT>>,
+    stats: Arc<Mutex<Stats>>,
+    ctx: ContextValue<DT>,
+    queue_config: QueueConfig,
+) -> Result<(), OxanaError>
+where
+    DT: Send + Sync + Clone + 'static,
+{
+    // Claim nothing before this process is registered: a processing list with
+    // no process record is a dead process's as far as a peer's sweep can tell,
+    // and it would put the job back on the queue while it still runs.
+    if !register(&runtime).await? {
+        return Ok(());
+    }
+
+    coordinator::run(runtime, stats, ctx, queue_config).await?;
+
+    tracing::trace!("Coordinator finished");
+
+    Ok(())
+}
+
 async fn resurrect_loop<DT>(runtime: Arc<Runtime<DT>>) -> Result<(), OxanaError>
 where
     DT: Send + Sync + Clone + 'static,
 {
+    // Sweeping before this process is registered would let it resurrect the
+    // jobs it is about to claim itself.
+    if !register(&runtime).await? {
+        return Ok(());
+    }
+
     runtime
         .storage
         .internal
