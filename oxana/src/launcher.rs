@@ -27,12 +27,16 @@ where
     let runtime = Runtime::new(storage, config, settings);
     let shutdown_signal = runtime.settings.consume_shutdown_signal();
     let runtime: Arc<Runtime<DT>> = Arc::new(runtime);
+    // Dropping run() also cancels descendants whose spawn handles live outside
+    // the launcher's JoinSets.
+    let _force_cancel_on_drop = runtime.force_cancel_token.clone().drop_guard();
     let mut joinset = JoinSet::new();
+    let mut ping_joinset = JoinSet::new();
     let mut coordinator_joinset = JoinSet::new();
     let stats = Arc::new(Mutex::new(Stats::default()));
     let ping_cancel_token = CancellationToken::new();
 
-    joinset.spawn(ping_loop(Arc::clone(&runtime), ping_cancel_token.clone()));
+    ping_joinset.spawn(ping_loop(Arc::clone(&runtime), ping_cancel_token.clone()));
     joinset.spawn(retry_loop(Arc::clone(&runtime)));
     joinset.spawn(schedule_loop(Arc::clone(&runtime)));
     joinset.spawn(resurrect_loop(Arc::clone(&runtime)));
@@ -51,69 +55,103 @@ where
         ));
     }
 
-    let mut result = Ok(());
-
     tokio::select! {
         Some(task_result) = joinset.join_next() => {
-            result = task_result?;
-
-            if result.is_ok() {
-                tracing::info!("Background task unexpectedly finished");
-            }
-
-            runtime.cancel_token.cancel();
+            record_task_result(&runtime, task_result);
         }
         Some(task_result) = coordinator_joinset.join_next() => {
-            result = task_result?;
-
-            if result.is_ok() {
-                tracing::info!("Background task unexpectedly finished");
-            }
-
-            runtime.cancel_token.cancel();
+            record_task_result(&runtime, task_result);
+        }
+        Some(task_result) = ping_joinset.join_next() => {
+            record_task_result(&runtime, task_result);
         }
         _ = runtime.cancel_token.cancelled() => {}
         _ = shutdown_signal => {
             tracing::info!("Received shutdown signal");
-            runtime.cancel_token.cancel();
         }
     }
 
     tracing::info!("Shutting down");
+    let deadline = tokio::time::Instant::now() + runtime.settings.shutdown_timeout;
+    runtime.cancel_token.cancel();
+    runtime.tasks.close();
 
-    while let Some(task_result) = coordinator_joinset.join_next().await {
-        let task_result = task_result?;
-        if result.is_ok()
-            && let Err(e) = task_result
-        {
-            result = Err(e);
+    let drained = tokio::time::timeout_at(deadline, async {
+        while let Some(task_result) = coordinator_joinset.join_next().await {
+            record_task_result(&runtime, task_result);
         }
-    }
-    ping_cancel_token.cancel();
-    while let Some(task_result) = joinset.join_next().await {
-        let task_result = task_result?;
-        if result.is_ok()
-            && let Err(e) = task_result
-        {
-            result = Err(e);
+        while let Some(task_result) = joinset.join_next().await {
+            record_task_result(&runtime, task_result);
         }
+        // Descendants can outlive their coordinator (notably batch workers).
+        // Keep heartbeating until every execution future has been dropped.
+        runtime.tasks.wait().await;
+        ping_cancel_token.cancel();
+        while let Some(task_result) = ping_joinset.join_next().await {
+            record_task_result(&runtime, task_result);
+        }
+
+        // Only remove registration after execution and heartbeats have stopped.
+        // This does not delete processing lists, so interrupted jobs survive.
+        if let Err(error) = runtime.storage.internal.self_cleanup().await {
+            runtime.fail(error);
+        }
+    })
+    .await;
+
+    if drained.is_err() {
+        tracing::error!("Shutdown timeout reached; cancelling remaining owned tasks");
+        runtime.force_cancel_token.cancel();
+        abort_and_join(&runtime, &mut coordinator_joinset).await;
+        abort_and_join(&runtime, &mut joinset).await;
+        // Aborting a parent only requests cancellation of its JoinSet children.
+        // Wait for their futures to actually drop before stopping heartbeats.
+        runtime.tasks.wait().await;
+        ping_cancel_token.cancel();
+        abort_and_join(&runtime, &mut ping_joinset).await;
+        tracing::warn!("Forced cancellation complete; interrupted jobs retained for resurrection");
+        // No fresh Redis timeout after the deadline. Registration can expire
+        // naturally, and the replacement process will recover processing lists.
     }
 
-    runtime.storage.internal.self_cleanup().await?;
-
+    debug_assert!(runtime.tasks.is_empty());
+    debug_assert_eq!(Arc::strong_count(&runtime), 1, "runtime tasks leaked");
+    let error = runtime
+        .take_shutdown_error()
+        .or_else(|| drained.is_err().then_some(OxanaError::ShutdownTimeout));
     let stats = Arc::try_unwrap(stats)
         .expect("Failed to unwrap Arc - there are still references to stats")
         .into_inner();
 
-    match result {
-        Ok(()) => {
+    match error {
+        None => {
             tracing::info!("Gracefully shut down");
             Ok(stats)
         }
-        Err(e) => {
-            tracing::error!("Gracefully shut down with errors");
-            Err(e)
+        Some(error) => {
+            tracing::error!(error = %error, "Shut down with error");
+            Err(error)
         }
+    }
+}
+
+async fn abort_and_join<DT>(runtime: &Runtime<DT>, tasks: &mut JoinSet<Result<(), OxanaError>>) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        // Intentional cancellation must not obscure a failure already observed,
+        // but preserve real errors from tasks that finished before the abort.
+        if !matches!(&result, Err(error) if error.is_cancelled()) {
+            record_task_result(runtime, result);
+        }
+    }
+}
+
+fn record_task_result<DT>(
+    runtime: &Runtime<DT>,
+    result: Result<Result<(), OxanaError>, tokio::task::JoinError>,
+) {
+    if let Err(error) = result.map_err(OxanaError::from).and_then(|result| result) {
+        runtime.fail(error);
     }
 }
 
@@ -277,11 +315,11 @@ where
         if !runtime.settings.runs_static_queue(&cron_job.queue_key) {
             continue;
         }
-        set.spawn(cron_job_loop(
+        set.spawn(runtime.tasks.track_future(cron_job_loop(
             Arc::clone(&runtime),
             name.clone(),
             cron_job.clone(),
-        ));
+        )));
     }
 
     if set.is_empty() {

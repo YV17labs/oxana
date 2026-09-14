@@ -28,6 +28,7 @@ impl QueueControlsMap {
         )
     }
 
+    #[cfg(test)]
     pub async fn busy_count(&self) -> usize {
         let map = self.inner.lock().await;
         map.values().map(|control| control.active_count()).sum()
@@ -94,6 +95,7 @@ impl QueueControl {
         self.notify.notify_waiters();
     }
 
+    #[cfg(test)]
     fn active_count(&self) -> usize {
         self.lock_state().active
     }

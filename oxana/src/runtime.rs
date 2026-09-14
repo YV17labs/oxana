@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, ErrorFormatterFn, RetryDelayOverrideFn, RuntimeSettings};
 use crate::context::ContextValue;
@@ -161,7 +162,13 @@ where
         self.shutdown_on(tokio::signal::ctrl_c())
     }
 
-    /// Sets the maximum time to wait for in-flight workers during shutdown.
+    /// Sets one deadline for draining workers, joining background tasks, and
+    /// removing the process registration during shutdown, shared by all queues.
+    ///
+    /// At the deadline, remaining owned asynchronous tasks are cancelled and
+    /// joined. Interrupted jobs remain available to the resurrection mechanism.
+    /// [`Self::run`] returns [`OxanaError::ShutdownTimeout`] after an ordinary
+    /// shutdown signal, or the initiating error if a task failure caused shutdown.
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.settings.shutdown_timeout = timeout;
         self
@@ -433,6 +440,11 @@ pub(crate) struct Runtime<DT> {
     pub(crate) settings: RuntimeSettings,
     pub(crate) storage: Storage,
     pub(crate) cancel_token: CancellationToken,
+    /// Tracks descendants as well as direct children, so aborting a coordinator
+    /// cannot leave batch workers or dispatchers running after shutdown returns.
+    pub(crate) tasks: TaskTracker,
+    pub(crate) force_cancel_token: CancellationToken,
+    shutdown_error: std::sync::Mutex<Option<OxanaError>>,
     /// Whether the first ping landed, so that every task needing this process
     /// to be registered waits on one registration instead of racing its own.
     /// `false` once cancelled before it did.
@@ -446,8 +458,36 @@ impl<DT> Runtime<DT> {
             settings,
             storage,
             cancel_token: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+            force_cancel_token: CancellationToken::new(),
+            shutdown_error: std::sync::Mutex::new(None),
             registered: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Record the first failure before notifying the launcher to start draining.
+    pub(crate) fn fail(&self, error: OxanaError) {
+        tracing::error!(error = %error, "Runtime task failed");
+        self.shutdown_error
+            .lock()
+            .expect("shutdown error mutex poisoned")
+            .get_or_insert(error);
+        self.cancel_token.cancel();
+    }
+
+    pub(crate) fn take_shutdown_error(&self) -> Option<OxanaError> {
+        self.shutdown_error
+            .lock()
+            .expect("shutdown error mutex poisoned")
+            .take()
+    }
+
+    pub(crate) fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.tasks.spawn(
+            self.force_cancel_token
+                .clone()
+                .run_until_cancelled_owned(future),
+        );
     }
 }
 

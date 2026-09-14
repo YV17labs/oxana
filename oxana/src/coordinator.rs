@@ -32,59 +32,43 @@ where
     let channel_capacity = queue_config.concurrency.default_concurrency().max(1);
     let (result_tx, result_rx) = mpsc::channel::<WorkerResult>(channel_capacity);
     let (job_tx, mut job_rx) = mpsc::channel::<WorkerJob>(channel_capacity);
-    let (batch_error_tx, mut batch_error_rx) = mpsc::channel::<OxanaError>(channel_capacity);
-    let (queue_task_error_tx, mut queue_task_error_rx) =
-        mpsc::channel::<OxanaError>(channel_capacity);
     let queue_controls = Arc::new(QueueControlsMap::new());
     let mut joinset = JoinSet::new();
     let mut batchers: HashMap<BatchKey, mpsc::Sender<PendingJob>> = HashMap::new();
 
-    joinset.spawn(result_collector::run(
+    joinset.spawn(config.tasks.track_future(result_collector::run(
         result_rx,
         Arc::clone(&config),
         Arc::clone(&stats),
-    ));
-    joinset.spawn(run_queue_watcher(
+    )));
+    joinset.spawn(config.tasks.track_future(run_queue_watcher(
         Arc::clone(&config),
         queue_config.clone(),
         job_tx.clone(),
         Arc::clone(&queue_controls),
-        queue_task_error_tx,
-    ));
+    )));
 
     loop {
         tokio::select! {
             job = job_rx.recv() => {
-                if let Some(job) = job {
-                    route_job(
+                if let Some(job) = job
+                    && let Err(error) = route_job(
                         Arc::clone(&config),
                         ctx.clone(),
                         result_tx.clone(),
-                        batch_error_tx.clone(),
                         job,
                         &mut batchers,
                         &mut joinset,
                     )
-                    .await?;
+                    .await {
+                    config.fail(error);
+                    break;
                 }
             }
             Some(task_result) = joinset.join_next() => {
-                task_result??;
-            }
-            batch_error = batch_error_rx.recv() => {
-                if let Some(error) = batch_error {
-                    return Err(error);
-                }
-            }
-            queue_task_error = queue_task_error_rx.recv() => {
-                match queue_task_error {
-                    Some(error) => return Err(error),
-                    None if config.cancel_token.is_cancelled() => break,
-                    None => {
-                        return Err(OxanaError::GenericError(
-                            "Queue task monitor closed unexpectedly".to_string(),
-                        ));
-                    }
+                if let Err(error) = task_result.map_err(OxanaError::from).and_then(|result| result) {
+                    config.fail(error);
+                    break;
                 }
             }
             _ = config.cancel_token.cancelled() => {
@@ -94,12 +78,22 @@ where
     }
 
     drop(batchers);
-    wait_for_workers_to_finish(config, Arc::clone(&queue_controls)).await;
+    // Claimed jobs still buffered here have not executed. Leave them in Redis's
+    // processing list for resurrection, but release their concurrency permits.
+    drop(job_rx);
+    drop(job_tx);
+    // Every worker and batcher retains a result sender until it finishes. The
+    // collector therefore drains results before exiting, without a separate
+    // permit-count wait that could hide task errors behind a blocked worker.
     drop(result_tx);
-    drop(batch_error_tx);
 
     while let Some(task_result) = joinset.join_next().await {
-        task_result??;
+        if let Err(error) = task_result
+            .map_err(OxanaError::from)
+            .and_then(|result| result)
+        {
+            config.fail(error);
+        }
     }
 
     Ok(())
@@ -129,7 +123,6 @@ async fn route_job<DT>(
     config: Arc<Runtime<DT>>,
     ctx: ContextValue<DT>,
     result_tx: mpsc::Sender<WorkerResult>,
-    batch_error_tx: mpsc::Sender<OxanaError>,
     job_event: WorkerJob,
     batchers: &mut HashMap<BatchKey, mpsc::Sender<PendingJob>>,
     joinset: &mut JoinSet<Result<(), OxanaError>>,
@@ -143,20 +136,16 @@ where
     };
 
     if let Some(batch_config) = config.registry.batch_config(&pending.envelope.job.name) {
-        send_to_batcher(
-            config,
-            ctx,
-            result_tx,
-            batch_error_tx,
-            batchers,
-            pending,
-            batch_config,
-        )
-        .await;
+        send_to_batcher(config, ctx, result_tx, batchers, pending, batch_config).await;
         return Ok(());
     }
 
-    joinset.spawn(process_pending_job(config, ctx, result_tx, pending));
+    joinset.spawn(config.tasks.track_future(process_pending_job(
+        Arc::clone(&config),
+        ctx,
+        result_tx,
+        pending,
+    )));
 
     Ok(())
 }
@@ -240,7 +229,6 @@ async fn send_to_batcher<DT>(
     config: Arc<Runtime<DT>>,
     ctx: ContextValue<DT>,
     result_tx: mpsc::Sender<WorkerResult>,
-    batch_error_tx: mpsc::Sender<OxanaError>,
     batchers: &mut HashMap<BatchKey, mpsc::Sender<PendingJob>>,
     pending: PendingJob,
     batch_config: WorkerBatchConfig,
@@ -258,7 +246,6 @@ async fn send_to_batcher<DT>(
                     Arc::clone(&config),
                     ctx.clone(),
                     result_tx.clone(),
-                    batch_error_tx.clone(),
                     batch_config.clone(),
                 )
             })
@@ -278,7 +265,6 @@ fn spawn_batcher<DT>(
     config: Arc<Runtime<DT>>,
     ctx: ContextValue<DT>,
     result_tx: mpsc::Sender<WorkerResult>,
-    batch_error_tx: mpsc::Sender<OxanaError>,
     batch_config: WorkerBatchConfig,
 ) -> mpsc::Sender<PendingJob>
 where
@@ -286,19 +272,13 @@ where
 {
     let batch_size = batch_config.size();
     let (tx, rx) = mpsc::channel(batch_size * 2);
-    tokio::spawn(async move {
-        if let Err(e) = run_batcher(
-            config,
-            ctx,
-            result_tx,
-            batch_error_tx.clone(),
-            batch_config,
-            rx,
-        )
-        .await
+    let task_config = Arc::clone(&config);
+    config.spawn(async move {
+        if let Err(e) =
+            run_batcher(Arc::clone(&task_config), ctx, result_tx, batch_config, rx).await
         {
             tracing::error!(error = %e, "Batcher exited with error");
-            batch_error_tx.send(e).await.ok();
+            task_config.fail(e);
         }
     });
     tx
@@ -308,7 +288,6 @@ async fn run_batcher<DT>(
     config: Arc<Runtime<DT>>,
     ctx: ContextValue<DT>,
     result_tx: mpsc::Sender<WorkerResult>,
-    batch_error_tx: mpsc::Sender<OxanaError>,
     batch_config: WorkerBatchConfig,
     mut rx: mpsc::Receiver<PendingJob>,
 ) -> Result<(), OxanaError>
@@ -331,7 +310,6 @@ where
                     Arc::clone(&config),
                     ctx.clone(),
                     result_tx.clone(),
-                    batch_error_tx.clone(),
                     &mut rx,
                     &mut pending,
                     batch_size,
@@ -346,7 +324,6 @@ where
                 Arc::clone(&config),
                 ctx.clone(),
                 result_tx.clone(),
-                batch_error_tx.clone(),
                 &mut pending,
             );
             continue;
@@ -370,7 +347,6 @@ where
                                 Arc::clone(&config),
                                 ctx.clone(),
                                 result_tx.clone(),
-                                batch_error_tx.clone(),
                                 &mut pending,
                             );
                             return Ok(());
@@ -385,7 +361,6 @@ where
                         Arc::clone(&config),
                         ctx.clone(),
                         result_tx.clone(),
-                        batch_error_tx.clone(),
                         &mut rx,
                         &mut pending,
                         batch_size,
@@ -400,7 +375,6 @@ where
             Arc::clone(&config),
             ctx.clone(),
             result_tx.clone(),
-            batch_error_tx.clone(),
             &mut pending,
         );
     }
@@ -410,7 +384,6 @@ async fn flush_batcher<DT>(
     config: Arc<Runtime<DT>>,
     ctx: ContextValue<DT>,
     result_tx: mpsc::Sender<WorkerResult>,
-    batch_error_tx: mpsc::Sender<OxanaError>,
     rx: &mut mpsc::Receiver<PendingJob>,
     pending: &mut Vec<PendingJob>,
     batch_size: usize,
@@ -422,24 +395,17 @@ async fn flush_batcher<DT>(
     while let Some(job) = rx.recv().await {
         pending.push(job);
         if pending.len() >= batch_size {
-            spawn_batch(
-                Arc::clone(&config),
-                ctx.clone(),
-                result_tx.clone(),
-                batch_error_tx.clone(),
-                pending,
-            );
+            spawn_batch(Arc::clone(&config), ctx.clone(), result_tx.clone(), pending);
         }
     }
 
-    spawn_batch(config, ctx, result_tx, batch_error_tx, pending);
+    spawn_batch(config, ctx, result_tx, pending);
 }
 
 fn spawn_batch<DT>(
     config: Arc<Runtime<DT>>,
     ctx: ContextValue<DT>,
     result_tx: mpsc::Sender<WorkerResult>,
-    batch_error_tx: mpsc::Sender<OxanaError>,
     pending: &mut Vec<PendingJob>,
 ) where
     DT: Send + Sync + Clone + 'static,
@@ -449,10 +415,12 @@ fn spawn_batch<DT>(
     }
 
     let batch = std::mem::take(pending);
-    tokio::spawn(async move {
-        if let Err(e) = process_pending_batch(config, ctx, result_tx, batch).await {
+    let task_config = Arc::clone(&config);
+    config.spawn(async move {
+        if let Err(e) = process_pending_batch(Arc::clone(&task_config), ctx, result_tx, batch).await
+        {
             tracing::error!(error = %e, "Failed to process job batch");
-            batch_error_tx.send(e).await.ok();
+            task_config.fail(e);
         }
     });
 }
@@ -580,7 +548,6 @@ async fn run_queue_watcher<DT>(
     queue_config: QueueConfig,
     job_tx: mpsc::Sender<WorkerJob>,
     queue_controls: Arc<QueueControlsMap>,
-    queue_task_error_tx: mpsc::Sender<OxanaError>,
 ) -> Result<(), OxanaError>
 where
     DT: Send + Sync + Clone + 'static,
@@ -631,8 +598,8 @@ where
             let watcher_base_queue_key = base_queue_key.clone();
             let watcher_default_runtime_config = default_runtime_config.clone();
             spawn_queue_task(
+                Arc::clone(&config),
                 "queue config watcher",
-                queue_task_error_tx.clone(),
                 run_queue_config_watcher(
                     watcher_config,
                     watcher_queue,
@@ -649,8 +616,8 @@ where
             let dispatcher_queue_control = Arc::clone(&queue_control);
             let dispatcher_queue = queue.clone();
             spawn_queue_task(
+                Arc::clone(&config),
                 "dispatcher",
-                queue_task_error_tx.clone(),
                 dispatcher::run(
                     dispatcher_config,
                     dispatcher_queue_config,
@@ -676,14 +643,16 @@ where
     }
 }
 
-fn spawn_queue_task<F>(task: &'static str, error_tx: mpsc::Sender<OxanaError>, future: F)
+fn spawn_queue_task<DT, F>(config: Arc<Runtime<DT>>, task: &'static str, future: F)
 where
+    DT: Send + Sync + 'static,
     F: Future<Output = Result<(), OxanaError>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    let task_config = Arc::clone(&config);
+    config.spawn(async move {
         if let Err(error) = future.await {
             tracing::error!(task, error = %error, "Queue task exited with error");
-            let _ = error_tx.try_send(error);
+            task_config.fail(error);
         }
     });
 }
@@ -753,36 +722,6 @@ where
                 }
             }
         }
-    }
-}
-
-async fn wait_for_workers_to_finish<DT>(
-    config: Arc<Runtime<DT>>,
-    queue_controls: Arc<QueueControlsMap>,
-) where
-    DT: Send + Sync + Clone + 'static,
-{
-    let t_start = std::time::Instant::now();
-    let mut ticks = 0;
-
-    loop {
-        ticks += 1;
-
-        let busy_count = queue_controls.busy_count().await;
-        if busy_count == 0 {
-            break;
-        }
-
-        if ticks % 200 == 0 {
-            tracing::info!("Waiting for {} workers to finish...", busy_count);
-        }
-
-        if t_start.elapsed() > config.settings.shutdown_timeout {
-            tracing::error!("Shutdown timeout reached");
-            break;
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -1040,24 +979,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_task_errors_are_forwarded() -> TestResult {
-        let (error_tx, mut error_rx) = mpsc::channel(1);
-
-        spawn_queue_task("test queue task", error_tx, async {
+    async fn queue_task_errors_initiate_shutdown() -> TestResult {
+        let storage = Storage::builder()
+            .namespace(random_string())
+            .build_from_pool(redis_pool().await?)?;
+        let runtime = Arc::new(Runtime::new(
+            storage,
+            Config::<()>::new(),
+            RuntimeSettings::new(),
+        ));
+        spawn_queue_task(Arc::clone(&runtime), "test queue task", async {
             Err(crate::OxanaError::GenericError(
                 "dispatcher failed".to_string(),
             ))
         });
-
-        let error = tokio::time::timeout(Duration::from_secs(1), error_rx.recv())
-            .await?
-            .expect("queue task error should be forwarded");
-
+        runtime.tasks.close();
+        tokio::time::timeout(Duration::from_secs(1), runtime.tasks.wait()).await?;
+        assert!(runtime.cancel_token.is_cancelled());
         assert!(matches!(
-            error,
-            crate::OxanaError::GenericError(message) if message == "dispatcher failed"
+            runtime.take_shutdown_error(),
+            Some(crate::OxanaError::GenericError(message)) if message == "dispatcher failed"
         ));
-
         Ok(())
     }
 }
