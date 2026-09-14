@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.7] - 2026-09-14
+
 ### Fixed
 
 - Never sweep a process that is alive and heartbeating. A sweep read the process set before scanning for processing lists, and the scan grows with the keyspace: a replica that registered and claimed a job while it ran was missing from that earlier read and taken for dead, so its job went back on the queue and ran a second time, concurrently. The process set is now read after the scan, and the runtime registers before it claims, so a processing list never exists without its process record.
