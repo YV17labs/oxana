@@ -133,7 +133,7 @@ pub(crate) async fn cron_jobs(
         active_tab: "/cron",
         rows,
         total,
-        enqueued: params.enqueued.as_deref() == Some("1"),
+        enqueued_job_id: params.enqueued,
     }
 }
 
@@ -142,9 +142,9 @@ pub(crate) async fn enqueue_cron_job(
     Form(form): Form<CronEnqueueJobForm>,
 ) -> Result<Redirect, OxanaWebError> {
     let envelope = cron_envelope_from_form(&state.catalog, &form)?;
-    state.storage.enqueue_envelope(envelope).await?;
+    let job_id = state.storage.enqueue_envelope(envelope).await?;
 
-    Ok(cron_enqueued_redirect(&state.base_path))
+    Ok(cron_enqueued_redirect(&state.base_path, &job_id))
 }
 
 pub(crate) async fn on_demand_jobs(
@@ -1059,8 +1059,11 @@ fn parse_optional_json(
         .transpose()
 }
 
-fn cron_enqueued_redirect(base_path: &str) -> Redirect {
-    Redirect::to(&format!("{base_path}/cron?enqueued=1"))
+fn cron_enqueued_redirect(base_path: &str, job_id: &str) -> Redirect {
+    Redirect::to(&format!(
+        "{base_path}/cron?enqueued={}",
+        urlencoding::encode(job_id)
+    ))
 }
 
 fn immediate_envelope(
@@ -1816,13 +1819,13 @@ mod tests {
 
     #[test]
     fn cron_enqueue_redirects_to_cron_notice() {
-        let redirect = cron_enqueued_redirect("/admin");
+        let redirect = cron_enqueued_redirect("/admin", "crate::Worker/type-123");
         let response = redirect.into_response();
 
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
-            "/admin/cron?enqueued=1"
+            "/admin/cron?enqueued=crate%3A%3AWorker%2Ftype-123"
         );
     }
 
