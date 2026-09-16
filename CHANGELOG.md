@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.9] - 2026-09-16
+
+### Changed
+
+- Add a "View job" link to the dashboard's cron enqueue confirmation and keep the notification visible instead of automatically dismissing it.
+
 ## [2.1.8] - 2026-09-14
 
 ### Added
