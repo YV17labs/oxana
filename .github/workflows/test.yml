@@ -41,6 +41,7 @@ jobs:
       - name: Test
         run: |
           cargo test --lib --no-default-features
+          cargo test -p oxana-mcp --all-targets
           cargo nextest run --all-features --no-fail-fast
 
       - name: Lint
