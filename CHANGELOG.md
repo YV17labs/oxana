@@ -18,6 +18,12 @@ All notable changes to this project will be documented in this file.
 - The uniqueness check and the enqueue of a unique job happen in one Redis script. Two pushes racing on one unique ID used to both see it free and both enqueue; a push that saw it taken was skipped while returning `Ok` with an ID. Concurrent pushes now file exactly one job, and a replacing push that finds the job moved queues re-reads it rather than leaving it on two queues.
 - A due job is claimed from its schedule and pushed onto its queue in one Redis script. A process dying between the two steps used to lose the job, and a cancel arriving between them answered `false` while the job then ran.
 
+## [2.1.9] - 2026-09-16
+
+### Changed
+
+- Add a "View job" link to the dashboard's cron enqueue confirmation and keep the notification visible instead of automatically dismissing it.
+
 ## [2.1.8] - 2026-09-14
 
 ### Added

@@ -857,7 +857,7 @@ pub(crate) struct CronTemplate {
     pub active_tab: &'static str,
     pub rows: Vec<CronRow>,
     pub total: usize,
-    pub enqueued: bool,
+    pub enqueued_job_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1299,7 +1299,7 @@ mod cron_tests {
                 depth: 0,
             }],
             total: 1,
-            enqueued: false,
+            enqueued_job_id: None,
         };
 
         let rendered = template.render().unwrap();
@@ -1317,13 +1317,15 @@ mod cron_tests {
             active_tab: "/cron",
             rows: Vec::new(),
             total: 0,
-            enqueued: true,
+            enqueued_job_id: Some("crate::Worker/type-123".to_string()),
         };
 
         let rendered = template.render().unwrap();
 
         assert!(rendered.contains("Cron job enqueued."));
-        assert!(rendered.contains("data-auto-dismiss-notice"));
+        assert!(rendered.contains("href=\"/admin/jobs/crate%3A%3AWorker%2Ftype-123\""));
+        assert!(rendered.contains(">View job</a>"));
+        assert!(!rendered.contains("data-auto-dismiss-notice"));
     }
 }
 

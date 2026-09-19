@@ -14,9 +14,10 @@
 
         {% include "_tabs.html" %}
 
-        {% if enqueued %}
-        <div data-auto-dismiss-notice class="mb-4 rounded border border-green-800 bg-green-950/40 px-4 py-3 text-sm text-green-300">
+        {% if let Some(job_id) = enqueued_job_id %}
+        <div class="mb-4 rounded border border-green-800 bg-green-950/40 px-4 py-3 text-sm text-green-300">
             Cron job enqueued.
+            <a href="{{ base_path }}/jobs/{{ job_id|urlencode_strict }}" class="underline hover:text-green-200">View job</a>
         </div>
         {% endif %}
 
@@ -67,7 +68,6 @@
         </div>
         {% endif %}
     </div>
-    {% include "_auto_dismiss_notices.html" %}
     {% include "_list_filter_script.html" %}
 </body>
 </html>
