@@ -36,7 +36,7 @@ pub(crate) async fn dashboard(
 pub(crate) async fn busy(
     Extension(state): Extension<OxanaWebState>,
 ) -> Result<BusyTemplate, OxanaWebError> {
-    let stats = state.storage.stats().await?;
+    let stats = state.storage.dashboard_stats().await?;
     let queue_configs = queue_config_map(&state.storage, &state.catalog, &stats).await?;
 
     Ok(BusyTemplate {

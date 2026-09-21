@@ -731,7 +731,7 @@ impl Storage {
     /// ```
     #[cfg(feature = "prometheus")]
     pub async fn metrics(&self) -> Result<PrometheusMetrics, OxanaError> {
-        let stats = self.stats().await?;
+        let stats = self.dashboard_stats().await?;
         Ok(PrometheusMetrics::from_stats(&stats))
     }
 }
