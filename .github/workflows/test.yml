@@ -58,5 +58,6 @@ jobs:
           cargo publish -p oxana-macros || true
           cargo publish -p oxana || true
           cargo publish -p oxana-web || true
+          cargo publish -p oxana-mcp || true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
