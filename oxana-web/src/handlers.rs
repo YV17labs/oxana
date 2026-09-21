@@ -22,7 +22,7 @@ const DEFAULT_QUEUE_SORT_DIRECTION: &str = "desc";
 pub(crate) async fn dashboard(
     Extension(state): Extension<OxanaWebState>,
 ) -> Result<DashboardTemplate, OxanaWebError> {
-    let stats = state.storage.stats().await?;
+    let stats = state.storage.dashboard_stats().await?;
     let queue_configs = queue_config_map(&state.storage, &state.catalog, &stats).await?;
 
     Ok(DashboardTemplate {
