@@ -410,6 +410,16 @@ impl Storage {
         self.internal.stats(self.dead_process_threshold()).await
     }
 
+    /// Returns dashboard statistics without reading historical queue-rate metrics.
+    ///
+    /// Counts, latency, processes, and active jobs have the same semantics as
+    /// [`Self::stats`]. Queue rate fields are left at their default values.
+    pub async fn dashboard_stats(&self) -> Result<Stats, OxanaError> {
+        self.internal
+            .dashboard_stats(self.dead_process_threshold())
+            .await
+    }
+
     /// Returns Sidekiq-style job execution metrics for all workers.
     ///
     /// Metrics are retained for up to 24 hours. The query defaults to 60 minutes
@@ -721,7 +731,7 @@ impl Storage {
     /// ```
     #[cfg(feature = "prometheus")]
     pub async fn metrics(&self) -> Result<PrometheusMetrics, OxanaError> {
-        let stats = self.stats().await?;
+        let stats = self.dashboard_stats().await?;
         Ok(PrometheusMetrics::from_stats(&stats))
     }
 }

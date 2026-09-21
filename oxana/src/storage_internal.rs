@@ -27,6 +27,7 @@ use queue_stats::{aggregate_queue_stats, queue_rate_stats};
 
 const JOB_EXPIRE_TIME: i64 = 7 * 24 * 3600; // 7 days
 const SCAN_BATCH_SIZE: usize = 500;
+const STATS_READ_BATCH_SIZE: usize = 500;
 const ENQUEUE_LIST_CHUNK_SIZE: usize = 100;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -625,6 +626,29 @@ impl StorageInternal {
         }
     }
 
+    async fn jobs_w_conn(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        ids: &[&str],
+    ) -> Result<Vec<Option<JobEnvelope>>, OxanaError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records: Vec<Option<String>> = redis::cmd("HMGET")
+            .arg(&self.keys.jobs)
+            .arg(ids)
+            .query_async(redis)
+            .await?;
+        records
+            .into_iter()
+            .map(|record| {
+                record
+                    .map(|record| serde_json::from_str(&record).map_err(OxanaError::from))
+                    .transpose()
+            })
+            .collect()
+    }
+
     pub async fn update_job(&self, envelope: &JobEnvelope) -> Result<(), OxanaError> {
         let mut redis = self.connection().await?;
         let _: () = redis::pipe()
@@ -1022,16 +1046,6 @@ impl StorageInternal {
         Ok(count as usize)
     }
 
-    async fn latency_s_w_conn(
-        &self,
-        redis: &mut deadpool_redis::Connection,
-        queue: &str,
-    ) -> Result<f64, OxanaError> {
-        self.latency_micros_w_conn(redis, queue)
-            .await
-            .map(|latency| latency / 1_000_000.0)
-    }
-
     pub async fn latency_ms(&self, queue: &str) -> Result<f64, OxanaError> {
         self.latency_micros(queue)
             .await
@@ -1094,21 +1108,39 @@ impl StorageInternal {
         matched_queues.sort();
         matched_queues.dedup();
 
-        self.build_queue_stats(&mut redis, &matched_queues, true)
+        self.build_queue_stats(&mut redis, &matched_queues, true, true)
             .await
     }
 
     pub async fn stats_queues(&self) -> Result<Vec<QueueStats>, OxanaError> {
         let mut redis = self.connection().await?;
         let queues = self.queues_w_conn(&mut redis, "*").await?;
-        self.build_queue_stats(&mut redis, &queues, false).await
+        self.build_queue_stats(&mut redis, &queues, false, true)
+            .await
     }
 
     pub async fn stats(&self, dead_process_threshold: Duration) -> Result<Stats, OxanaError> {
+        self.stats_with_rates(dead_process_threshold, true).await
+    }
+
+    pub async fn dashboard_stats(
+        &self,
+        dead_process_threshold: Duration,
+    ) -> Result<Stats, OxanaError> {
+        self.stats_with_rates(dead_process_threshold, false).await
+    }
+
+    async fn stats_with_rates(
+        &self,
+        dead_process_threshold: Duration,
+        include_rates: bool,
+    ) -> Result<Stats, OxanaError> {
         let mut redis = self.connection().await?;
 
         let queues = self.queues_w_conn(&mut redis, "*").await?;
-        let values = self.build_queue_stats(&mut redis, &queues, false).await?;
+        let values = self
+            .build_queue_stats(&mut redis, &queues, false, include_rates)
+            .await?;
 
         let mut processed_count_total = 0;
         let mut enqueued_count_total = 0;
@@ -1129,33 +1161,51 @@ impl StorageInternal {
             failed_count_total += value.failed;
         }
 
-        let processes = self.processes(dead_process_threshold).await?;
-
+        let processes = self
+            .processes_w_conn(&mut redis, dead_process_threshold)
+            .await?;
         let mut processing = vec![];
-
-        for process in processes.iter() {
-            let processing_queue = self.processing_queue(&process.id());
-            let job_ids: Vec<String> = (*redis).lrange(&processing_queue, 0, -1).await?;
-
-            for job_id in job_ids {
-                if let Some(envelope) = self.get_job(&job_id).await? {
-                    processing.push(StatsProcessing {
-                        process_id: process.id(),
-                        job_envelope: envelope,
-                    });
+        for chunk in processes.chunks(STATS_READ_BATCH_SIZE) {
+            let mut pipe = redis::pipe();
+            for process in chunk {
+                pipe.lrange(self.processing_queue(&process.id()), 0, -1);
+            }
+            let lists: Vec<Vec<String>> = pipe.query_async(&mut redis).await?;
+            let entries: Vec<_> = chunk
+                .iter()
+                .zip(lists)
+                .flat_map(|(process, ids)| ids.into_iter().map(move |id| (process.id(), id)))
+                .collect();
+            for entries in entries.chunks(STATS_READ_BATCH_SIZE) {
+                let ids: Vec<_> = entries.iter().map(|(_, id)| id.as_str()).collect();
+                let envelopes = self.jobs_w_conn(&mut redis, &ids).await?;
+                for ((process_id, _), envelope) in entries.iter().zip(envelopes) {
+                    if let Some(job_envelope) = envelope {
+                        processing.push(StatsProcessing {
+                            process_id: process_id.clone(),
+                            job_envelope,
+                        });
+                    }
                 }
             }
         }
+        let (jobs, dead, scheduled, retries): (usize, usize, usize, usize) = redis::pipe()
+            .hlen(&self.keys.jobs)
+            .llen(&self.keys.dead)
+            .zcard(&self.keys.schedule)
+            .zcard(&self.keys.retry)
+            .query_async(&mut redis)
+            .await?;
 
         Ok(Stats {
             global: StatsGlobal {
-                jobs: self.jobs_count().await?,
+                jobs,
                 enqueued: enqueued_count_total,
                 processed: processed_count_total,
                 failed: failed_count_total,
-                dead: self.dead_count().await?,
-                scheduled: self.scheduled_count().await?,
-                retries: self.retries_count().await?,
+                dead,
+                scheduled,
+                retries,
                 latency_s_max,
             },
             processing,
@@ -1169,58 +1219,80 @@ impl StorageInternal {
         redis: &mut deadpool_redis::Connection,
         queues: &[String],
         filter: bool,
+        include_rates: bool,
     ) -> Result<Vec<QueueStats>, OxanaError> {
         let now = chrono::Utc::now().timestamp();
-        let rate_minutes = metric_minutes(now, JobMetricsQuery::new(QUEUE_RATE_WINDOW_MINUTES));
+        let rate_minutes = if include_rates {
+            metric_minutes(now, JobMetricsQuery::new(QUEUE_RATE_WINDOW_MINUTES))
+        } else {
+            Vec::new()
+        };
         let inputs = self.queue_stats_inputs(redis, &rate_minutes).await?;
 
         let (mut values, enqueued_snapshots) =
             aggregate_queue_stats(queues, inputs.stats, filter, now);
 
+        let keys: Vec<String> = values
+            .iter()
+            .flat_map(|value| {
+                if value.queues.is_empty() {
+                    vec![value.key.clone()]
+                } else {
+                    value
+                        .queues
+                        .iter()
+                        .map(|queue| format!("{}#{}", value.key, queue.suffix))
+                        .collect()
+                }
+            })
+            .collect();
+        let live = self
+            .queue_lengths_and_latencies(redis, &keys, &enqueued_snapshots)
+            .await?;
+
         for value in values.iter_mut() {
             if value.queues.is_empty() {
-                value.enqueued = match enqueued_snapshots.get(&value.key).copied() {
-                    Some(enqueued) => enqueued,
-                    None => self.enqueued_count_w_conn(redis, &value.key).await?,
-                };
-                value.latency_s = self.latency_s_w_conn(redis, &value.key).await?;
-                value.rate = queue_rate_stats(
-                    &value.key,
-                    value.enqueued,
-                    &inputs.queue_length_rate_hashes,
-                    &inputs.queue_counter_totals,
-                );
-            } else {
-                for dynamic_queue in value.queues.iter_mut() {
-                    let dynamic_queue_key = format!("{}#{}", value.key, dynamic_queue.suffix);
-                    let enqueued = match enqueued_snapshots.get(&dynamic_queue_key).copied() {
-                        Some(enqueued) => enqueued,
-                        None => {
-                            self.enqueued_count_w_conn(redis, &dynamic_queue_key)
-                                .await?
-                        }
-                    };
-                    let latency_s = self.latency_s_w_conn(redis, &dynamic_queue_key).await?;
-
-                    dynamic_queue.enqueued = enqueued;
-                    dynamic_queue.latency_s = latency_s;
-                    dynamic_queue.rate = queue_rate_stats(
-                        &dynamic_queue_key,
-                        dynamic_queue.enqueued,
+                (value.enqueued, value.latency_s) = *live
+                    .get(&value.key)
+                    .expect("every queue has a batched result");
+                if include_rates {
+                    value.rate = queue_rate_stats(
+                        &value.key,
+                        value.enqueued,
                         &inputs.queue_length_rate_hashes,
                         &inputs.queue_counter_totals,
                     );
+                }
+            } else {
+                for dynamic_queue in value.queues.iter_mut() {
+                    let dynamic_queue_key = format!("{}#{}", value.key, dynamic_queue.suffix);
+                    let (enqueued, latency_s) = *live
+                        .get(&dynamic_queue_key)
+                        .expect("every dynamic queue has a batched result");
+
+                    dynamic_queue.enqueued = enqueued;
+                    dynamic_queue.latency_s = latency_s;
+                    if include_rates {
+                        dynamic_queue.rate = queue_rate_stats(
+                            &dynamic_queue_key,
+                            dynamic_queue.enqueued,
+                            &inputs.queue_length_rate_hashes,
+                            &inputs.queue_counter_totals,
+                        );
+                    }
 
                     if value.latency_s < latency_s {
                         value.latency_s = latency_s;
                     }
                     value.enqueued += enqueued;
                 }
-                value.rate = QueueRateStats::aggregate(
-                    QUEUE_RATE_WINDOW_MINUTES,
-                    value.enqueued,
-                    value.queues.iter().map(|queue| queue.rate),
-                );
+                if include_rates {
+                    value.rate = QueueRateStats::aggregate(
+                        QUEUE_RATE_WINDOW_MINUTES,
+                        value.enqueued,
+                        value.queues.iter().map(|queue| queue.rate),
+                    );
+                }
             }
 
             value.queues.sort_by(|a, b| a.suffix.cmp(&b.suffix));
@@ -1229,6 +1301,55 @@ impl StorageInternal {
         values.sort_by(|a, b| a.key.cmp(&b.key));
 
         Ok(values)
+    }
+
+    async fn queue_lengths_and_latencies(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        keys: &[String],
+        snapshots: &HashMap<String, usize>,
+    ) -> Result<HashMap<String, (usize, f64)>, OxanaError> {
+        let mut live = HashMap::new();
+        for keys in keys.chunks(STATS_READ_BATCH_SIZE) {
+            let mut pipe = redis::pipe();
+            for key in keys {
+                pipe.lindex(self.namespace_queue(key), -1);
+            }
+            let heads: Vec<Option<String>> = pipe.query_async(redis).await?;
+            let missing_lengths: Vec<_> = keys
+                .iter()
+                .filter(|key| !snapshots.contains_key(*key))
+                .collect();
+            let lengths: Vec<usize> = if missing_lengths.is_empty() {
+                Vec::new()
+            } else {
+                let mut pipe = redis::pipe();
+                for key in &missing_lengths {
+                    pipe.llen(self.namespace_queue(key));
+                }
+                pipe.query_async(redis).await?
+            };
+            let mut lengths = lengths.into_iter();
+            let ids: Vec<_> = heads.iter().filter_map(|head| head.as_deref()).collect();
+            let mut envelopes = self.jobs_w_conn(redis, &ids).await?.into_iter();
+            for (key, head) in keys.iter().zip(heads) {
+                let latency = if head.is_some() {
+                    envelopes.next().flatten().map_or(0.0, |envelope| {
+                        (chrono::Utc::now().timestamp_micros()
+                            - envelope.meta.effective_scheduled_at_micros())
+                            as f64
+                            / 1_000_000.0
+                    })
+                } else {
+                    0.0
+                };
+                let count = snapshots.get(key).copied().unwrap_or_else(|| {
+                    lengths.next().expect("uncached queue lengths were fetched")
+                });
+                live.insert(key.clone(), (count, latency));
+            }
+        }
+        Ok(live)
     }
 
     async fn queue_stats_inputs(
@@ -1627,36 +1748,38 @@ impl StorageInternal {
         Ok(count)
     }
 
-    pub async fn get_process_data(&self, id: &str) -> Result<Option<Process>, OxanaError> {
-        let mut redis = self.connection().await?;
-        let process_str: Option<String> = (*redis).hget(&self.keys.processes_data, id).await?;
-        match process_str {
-            Some(process_str) => Ok(Some(serde_json::from_str(&process_str)?)),
-            None => Ok(None),
-        }
-    }
-
     pub async fn processes(
         &self,
         dead_process_threshold: Duration,
     ) -> Result<Vec<Process>, OxanaError> {
         let mut redis = self.connection().await?;
-        let process_ids: Vec<String> = (*redis)
+        self.processes_w_conn(&mut redis, dead_process_threshold)
+            .await
+    }
+
+    async fn processes_w_conn(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        dead_process_threshold: Duration,
+    ) -> Result<Vec<Process>, OxanaError> {
+        let process_ids: Vec<String> = redis
             .zrangebyscore(
                 &self.keys.processes,
                 unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64(),
                 unix_timestamp_secs_f64(),
             )
             .await?;
-
-        let mut processes = vec![];
-
-        for process_id in process_ids {
-            if let Some(process) = self.get_process_data(&process_id).await? {
-                processes.push(process);
+        let mut processes = Vec::new();
+        for ids in process_ids.chunks(STATS_READ_BATCH_SIZE) {
+            let records: Vec<Option<String>> = redis::cmd("HMGET")
+                .arg(&self.keys.processes_data)
+                .arg(ids)
+                .query_async(redis)
+                .await?;
+            for record in records.into_iter().flatten() {
+                processes.push(serde_json::from_str(&record)?);
             }
         }
-
         Ok(processes)
     }
 
@@ -2371,10 +2494,10 @@ mod tests {
         let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
         storage.ping().await?;
 
-        let process = storage.current_process();
-        let process_data = storage.get_process_data(&process.id()).await?;
-        assert!(process_data.is_some());
-        let process = process_data.unwrap();
+        let processes = storage.processes(DEAD_PROCESS_THRESHOLD).await?;
+        assert_eq!(processes.len(), 1);
+        let process = processes.first().expect("ping should register a process");
+        assert_eq!(process.id(), storage.current_process().id());
         assert_eq!(
             process.hostname,
             gethostname::gethostname().to_string_lossy().to_string()
@@ -2884,6 +3007,169 @@ mod tests {
         assert_eq!(dynamic_queue_stats.processed, 2);
         assert_eq!(dynamic_queue_stats.succeeded, 2);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stats_batch_processing_with_one_connection() -> TestResult {
+        let pool = redis_pool().await?;
+        pool.resize(1);
+        let storage = StorageInternal::new(pool, Some(random_string()));
+        let mut redis = storage.connection().await?;
+        let mut pipe = redis::pipe();
+        let mut expected = Vec::new();
+        for index in 0..=STATS_READ_BATCH_SIZE {
+            let mut process = storage.current_process();
+            process.instance_id = format!("process-{index:04}");
+            let id = process.id();
+            let envelope = JobEnvelope::new(format!("queue-{index}"), TestJob {})?;
+            pipe.zadd(&storage.keys.processes, &id, unix_timestamp_secs_f64())
+                .hset(
+                    &storage.keys.processes_data,
+                    &id,
+                    serde_json::to_string(&process)?,
+                )
+                .hset(
+                    &storage.keys.jobs,
+                    &envelope.id,
+                    serde_json::to_string(&envelope)?,
+                )
+                .rpush(storage.processing_queue(&id), &["missing", &envelope.id]);
+            expected.push((id, envelope.id, envelope.queue));
+        }
+        // A heartbeat with no process record must not create a process row.
+        pipe.zadd(
+            &storage.keys.processes,
+            "missing-process",
+            unix_timestamp_secs_f64(),
+        );
+        let _: () = pipe.query_async(&mut redis).await?;
+        drop(redis);
+
+        let stats = tokio::time::timeout(
+            Duration::from_secs(10),
+            storage.stats(Duration::from_secs(60)),
+        )
+        .await??;
+        assert_eq!(stats.processes.len(), STATS_READ_BATCH_SIZE + 1);
+        assert_eq!(stats.global.jobs, STATS_READ_BATCH_SIZE + 1);
+        let mut actual: Vec<_> = stats
+            .processing
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.process_id,
+                    entry.job_envelope.id,
+                    entry.job_envelope.queue,
+                )
+            })
+            .collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stats_batch_queue_heads_and_snapshot_lengths() -> TestResult {
+        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let mut redis = storage.connection().await?;
+        let mut pipe = redis::pipe();
+        let mut keys = Vec::new();
+        let mut snapshots = HashMap::new();
+        for index in 0..=STATS_READ_BATCH_SIZE {
+            let key = format!("queue-{index}");
+            if index % 3 == 0 {
+                let mut envelope = JobEnvelope::new(key.clone(), TestJob {})?;
+                envelope.meta.scheduled_at = chrono::Utc::now().timestamp_micros() - 60_000_000;
+                pipe.hset(
+                    &storage.keys.jobs,
+                    &envelope.id,
+                    serde_json::to_string(&envelope)?,
+                )
+                .rpush(storage.namespace_queue(&key), &envelope.id);
+            } else if index % 3 == 1 {
+                pipe.rpush(storage.namespace_queue(&key), "missing-job");
+            }
+            if index % 2 == 0 {
+                snapshots.insert(key.clone(), 42);
+            }
+            keys.push(key);
+        }
+        let _: () = pipe.query_async(&mut redis).await?;
+        let before = std::time::Instant::now();
+        let values = storage
+            .queue_lengths_and_latencies(&mut redis, &keys, &snapshots)
+            .await?;
+        for (index, key) in keys.iter().enumerate() {
+            let (length, latency) = *values.get(key).expect("queue result should exist");
+            assert_eq!(
+                length,
+                if index % 2 == 0 {
+                    42
+                } else {
+                    usize::from(index % 3 != 2)
+                }
+            );
+            if index % 3 == 0 {
+                assert!((60.0..65.0 + before.elapsed().as_secs_f64()).contains(&latency));
+            } else {
+                assert_eq!(latency, 0.0);
+            }
+        }
+        assert!(
+            storage
+                .queue_lengths_and_latencies(&mut redis, &[], &HashMap::new())
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_stats_skip_history_and_preserve_counts() -> TestResult {
+        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let threshold = Duration::from_secs(60);
+        let empty = storage.dashboard_stats(threshold).await?;
+        assert!(empty.queues.is_empty());
+        assert!(empty.processing.is_empty());
+        assert!(empty.processes.is_empty());
+        storage.ping().await?;
+        for key in ["static", "dynamic#a", "dynamic#b"] {
+            storage
+                .enqueue(JobEnvelope::new(key.to_string(), TestJob {})?)
+                .await?;
+        }
+        let full = storage.stats(threshold).await?;
+        let dashboard = storage.dashboard_stats(threshold).await?;
+        assert_eq!(full.global.enqueued, dashboard.global.enqueued);
+        assert_eq!(full.global.jobs, dashboard.global.jobs);
+        assert_eq!(full.global.dead, dashboard.global.dead);
+        assert_eq!(full.global.scheduled, dashboard.global.scheduled);
+        assert_eq!(full.global.retries, dashboard.global.retries);
+        assert_eq!(full.processes.len(), dashboard.processes.len());
+        for (full, dashboard) in full.queues.iter().zip(&dashboard.queues) {
+            assert_eq!(full.key, dashboard.key);
+            assert_eq!(full.enqueued, dashboard.enqueued);
+            assert!((full.latency_s - dashboard.latency_s).abs() < 5.0);
+            assert_eq!(dashboard.rate.window_minutes, 0);
+            for (full, dashboard) in full.queues.iter().zip(&dashboard.queues) {
+                assert_eq!(full.suffix, dashboard.suffix);
+                assert_eq!(full.enqueued, dashboard.enqueued);
+                assert_eq!(dashboard.rate.window_minutes, 0);
+            }
+        }
+        // Wrong-type history keys prove the dashboard never reads rate history.
+        let mut redis = storage.connection().await?;
+        let mut pipe = redis::pipe();
+        for minute in metric_minutes(chrono::Utc::now().timestamp(), JobMetricsQuery::new(10)) {
+            pipe.set(storage.metrics_queue_length_key(minute), "not-a-hash")
+                .set(storage.metrics_queue_counter_key(minute), "not-a-hash");
+        }
+        let _: () = pipe.query_async(&mut redis).await?;
+        drop(redis);
+        assert_eq!(storage.dashboard_stats(threshold).await?.global.enqueued, 3);
+        assert!(storage.stats(threshold).await.is_err());
         Ok(())
     }
 
