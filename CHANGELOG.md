@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.10] - 2026-09-21
+
+### Added
+
+- Add `oxana-mcp`, a bearer-authenticated, read-only MCP server for monitoring Oxana jobs and queues.
+- Add `Storage::dashboard_stats()` to retrieve statistics without historical queue-rate metrics.
+
+### Changed
+
+- Speed up dashboard statistics with batched Redis reads, and skip unused queue-rate history on the dashboard, Busy page, and Prometheus metrics endpoint.
+
 ## [2.1.9] - 2026-09-16
 
 ### Changed
