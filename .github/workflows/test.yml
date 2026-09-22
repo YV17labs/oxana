@@ -41,6 +41,7 @@ jobs:
       - name: Test
         run: |
           cargo test --lib --no-default-features
+          cargo test -p oxana-mcp --all-targets
           cargo nextest run --all-features --no-fail-fast
 
       - name: Lint
@@ -57,5 +58,6 @@ jobs:
           cargo publish -p oxana-macros || true
           cargo publish -p oxana || true
           cargo publish -p oxana-web || true
+          cargo publish -p oxana-mcp || true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

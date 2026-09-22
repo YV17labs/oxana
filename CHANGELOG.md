@@ -18,6 +18,17 @@ All notable changes to this project will be documented in this file.
 - The uniqueness check and the enqueue of a unique job happen in one Redis script. Two pushes racing on one unique ID used to both see it free and both enqueue; a push that saw it taken was skipped while returning `Ok` with an ID. Concurrent pushes now file exactly one job, and a replacing push that finds the job moved queues re-reads it rather than leaving it on two queues.
 - A due job is claimed from its schedule and pushed onto its queue in one Redis script. A process dying between the two steps used to lose the job, and a cancel arriving between them answered `false` while the job then ran.
 
+## [2.1.10] - 2026-09-21
+
+### Added
+
+- Add `oxana-mcp`, a bearer-authenticated, read-only MCP server for monitoring Oxana jobs and queues.
+- Add `Storage::dashboard_stats()` to retrieve statistics without historical queue-rate metrics.
+
+### Changed
+
+- Speed up dashboard statistics with batched Redis reads, and skip unused queue-rate history on the dashboard, Busy page, and Prometheus metrics endpoint.
+
 ## [2.1.9] - 2026-09-16
 
 ### Changed

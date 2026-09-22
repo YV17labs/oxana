@@ -17,11 +17,12 @@ This file provides guidance to any coding agent (Claude, ChatGPT, etc.) when wor
 
 ### Package Structure
 
-This is a Rust workspace with three crates:
+This is a Rust workspace with four crates:
 
 - `oxana/` - Main job processing library
 - `oxana-macros/` - Proc macros for Oxana
 - `oxana-web/` - Web UI dashboard for monitoring jobs, queues, and cron
+- `oxana-mcp/` - Bearer-authenticated, read-only MCP monitoring server
 
 ## Architecture Overview
 
@@ -56,6 +57,7 @@ The workspace is organized as:
 - `oxana/` contains the main library implementation
 - `oxana-macros/` contains proc macros
 - `oxana-web/` contains the web UI dashboard (uses askama templates + axum)
+- `oxana-mcp/` contains the MCP server (uses rmcp + axum) and a standalone example
 
 ### Testing
 

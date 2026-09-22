@@ -30,6 +30,7 @@ Oxana focuses on simplicity and depth over breadth - one backend, done well.
 - **Graceful Shutdown** - clean shutdown with in-progress job handling
 - **Web Dashboard** - built-in UI for monitoring jobs, queues, metrics, and cron - pure Rust, no JS toolchain
 - **Prometheus Metrics** - export queue and job metrics for monitoring
+- **MCP Server** - bearer-authenticated, read-only monitoring for coding agents via the separate [`oxana-mcp`](https://github.com/pragmaplatform/oxana/tree/main/oxana-mcp) crate
 - **Well Tested** - comprehensive integration test suite
 
 ## Quick Start
