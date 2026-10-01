@@ -598,6 +598,14 @@ impl StorageInternal {
 
     pub async fn dequeue(&self, queue: &str) -> Result<Option<JobId>, OxanaError> {
         let mut redis = self.connection().await?;
+        self.dequeue_w_conn(&mut redis, queue).await
+    }
+
+    pub(crate) async fn dequeue_w_conn(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        queue: &str,
+    ) -> Result<Option<JobId>, OxanaError> {
         let job_id: Option<JobId> = redis
             .lmove(
                 self.namespace_queue(queue),
