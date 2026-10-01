@@ -159,7 +159,14 @@ where
 {
     tracing::trace!("Processing job: {:?}", job_event);
 
-    let envelope: JobEnvelope = match config.storage.internal.get_job(&job_event.job_id).await {
+    let result = tokio::select! {
+        biased;
+        // Cancellation leaves the claim for ordinary shutdown recovery. It
+        // must not be treated as a missing payload and delete the job.
+        _ = config.cancel_token.cancelled() => return Ok(None),
+        result = config.storage.internal.get_claimed_job(&job_event.job_id) => result,
+    };
+    let envelope: JobEnvelope = match result {
         Ok(Some(envelope)) => envelope,
         Ok(None) => {
             tracing::warn!("Job {} not found", job_event.job_id);
@@ -167,6 +174,7 @@ where
                 #[cfg(feature = "sentry")]
                 sentry_core::capture_error(&e);
                 tracing::error!("Failed to delete job: {}", e);
+                return Err(e);
             }
             return Ok(None);
         }
@@ -174,7 +182,9 @@ where
             #[cfg(feature = "sentry")]
             sentry_core::capture_error(&e);
             tracing::error!("Failed to get job envelope: {}", e);
-            return Ok(None);
+            // This job is already claimed. Propagate the failure so shutdown
+            // makes its processing list eligible for resurrection.
+            return Err(e);
         }
     };
 
@@ -213,6 +223,7 @@ where
                 #[cfg(feature = "sentry")]
                 sentry_core::capture_error(&e);
                 tracing::error!("Failed to kill job: {}", e);
+                return Err(e);
             }
             return Ok(());
         }
@@ -457,6 +468,7 @@ where
                     #[cfg(feature = "sentry")]
                     sentry_core::capture_error(&e);
                     tracing::error!("Failed to kill job: {}", e);
+                    return Err(e);
                 }
             }
             return Ok(());
@@ -476,6 +488,7 @@ where
                     #[cfg(feature = "sentry")]
                     sentry_core::capture_error(&e);
                     tracing::error!("Failed to kill job: {}", e);
+                    return Err(e);
                 }
 
                 drop(job.permit);
@@ -727,7 +740,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingJob, process_pending_batch, spawn_queue_task};
+    use super::{
+        PendingJob, load_pending_job, process_pending_batch, process_pending_job, spawn_queue_task,
+    };
     use crate::QueueRuntimeConfig;
     use crate::config::{Config, RuntimeSettings};
     use crate::context::ContextValue;
@@ -736,6 +751,7 @@ mod tests {
     use crate::test_helper::{random_string, redis_pool};
     use crate::worker_registry::{self, BatchBuild, InvalidBatchJob, WorkerConfigKind};
     use crate::{Job, JobEnvelope, Storage, Worker, WorkerConfig};
+    use deadpool_redis::redis::AsyncCommands;
     use serde::{Deserialize, Serialize};
     use std::{sync::Arc, time::Duration};
     use testresult::TestResult;
@@ -783,6 +799,144 @@ mod tests {
                 },
             ],
         })
+    }
+
+    #[tokio::test]
+    async fn missing_job_cleanup_error_is_propagated() -> TestResult {
+        let pool = redis_pool().await?;
+        let storage = Storage::builder()
+            .namespace(random_string())
+            .build_from_pool(pool.clone())?;
+        let queue = random_string();
+        let envelope = JobEnvelope::new(queue.clone(), UnsortedInvalidJob)?;
+        storage.internal.enqueue(envelope.clone()).await?;
+        storage.internal.dequeue(&queue).await?;
+        let mut redis = pool.get().await?;
+        let _: () = redis
+            .hdel(format!("{}:jobs", storage.namespace()), &envelope.id)
+            .await?;
+        // The missing payload is normal; failure to clean up its claim is not.
+        let _: () = redis
+            .set(format!("{}:schedule", storage.namespace()), "wrong-type")
+            .await?;
+        let controls = QueueControlsMap::new();
+        let control = controls
+            .get_or_create(queue, QueueRuntimeConfig::new(1))
+            .await;
+        let event = crate::worker_event::WorkerJob {
+            job_id: envelope.id,
+            permit: control.acquire().await,
+        };
+        let runtime = Arc::new(Runtime::new(
+            storage,
+            Config::<()>::new(),
+            RuntimeSettings::new(),
+        ));
+
+        let result = load_pending_job(runtime, event).await;
+        let Err(crate::OxanaError::DeadpoolRedisError(error)) = result else {
+            panic!("expected the cleanup Redis error");
+        };
+        assert!(
+            error
+                .into_server_errors()
+                .unwrap()
+                .iter()
+                .any(|(_, error)| error.code() == "WRONGTYPE")
+        );
+        assert_eq!(controls.busy_count().await, 0);
+        Ok(())
+    }
+
+    enum InvalidDispatch {
+        Single,
+        BatchFactory,
+        BatchItems,
+    }
+
+    #[tokio::test]
+    async fn invalid_single_job_cleanup_error_is_propagated() -> TestResult {
+        invalid_job_cleanup_error(InvalidDispatch::Single).await
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_factory_cleanup_error_is_propagated() -> TestResult {
+        invalid_job_cleanup_error(InvalidDispatch::BatchFactory).await
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_items_cleanup_error_is_propagated() -> TestResult {
+        invalid_job_cleanup_error(InvalidDispatch::BatchItems).await
+    }
+
+    async fn invalid_job_cleanup_error(dispatch: InvalidDispatch) -> TestResult {
+        let pool = redis_pool().await?;
+        let storage = Storage::builder()
+            .namespace(random_string())
+            .build_from_pool(pool.clone())?;
+        let queue = random_string();
+        let mut config = Config::<()>::new();
+        if matches!(dispatch, InvalidDispatch::BatchItems) {
+            config.register_worker_with(WorkerConfig {
+                name: UnsortedInvalidJob::name().to_string(),
+                legacy_names: Vec::new(),
+                factory: worker_registry::job_factory::<
+                    UnsortedInvalidWorker,
+                    UnsortedInvalidJob,
+                    (),
+                >,
+                batch_factory: unsorted_invalid_batch_factory,
+                batch_config: Some(crate::WorkerBatchConfig::new(2, Duration::from_millis(100))),
+                on_demand: None,
+                kind: WorkerConfigKind::Normal,
+            });
+        }
+        let count = if matches!(dispatch, InvalidDispatch::Single) {
+            1
+        } else {
+            2
+        };
+        let controls = QueueControlsMap::new();
+        let control = controls
+            .get_or_create(queue.clone(), QueueRuntimeConfig::new(count))
+            .await;
+        let mut pending = Vec::new();
+        for _ in 0..count {
+            let envelope = JobEnvelope::new(queue.clone(), UnsortedInvalidJob)?;
+            storage.internal.enqueue(envelope.clone()).await?;
+            storage.internal.dequeue(&queue).await?;
+            pending.push(PendingJob {
+                envelope,
+                permit: control.acquire().await,
+            });
+        }
+        let mut redis = pool.get().await?;
+        let processing: Vec<String> = redis
+            .keys(format!("{}:processing:*", storage.namespace()))
+            .await?;
+        assert_eq!(processing.len(), 1);
+        // Fail before kill can perform any writes. Keep an existing connection
+        // to verify the claims survive and all local permits are released.
+        pool.close();
+        let runtime = Arc::new(Runtime::new(storage, config, RuntimeSettings::new()));
+        let (tx, _rx) = mpsc::channel(1);
+        let result = match dispatch {
+            InvalidDispatch::Single => {
+                process_pending_job(runtime, ContextValue::new(()), tx, pending.pop().unwrap())
+                    .await
+            }
+            InvalidDispatch::BatchFactory | InvalidDispatch::BatchItems => {
+                process_pending_batch(runtime, ContextValue::new(()), tx, pending).await
+            }
+        };
+        assert!(matches!(
+            result,
+            Err(crate::OxanaError::DeadpoolRedisPoolError(_))
+        ));
+        assert_eq!(controls.busy_count().await, 0);
+        let retained: usize = redis.llen(processing.first().unwrap()).await?;
+        assert_eq!(retained, count);
+        Ok(())
     }
 
     #[tokio::test]

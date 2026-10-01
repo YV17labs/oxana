@@ -309,6 +309,15 @@ where
 
     /// Sets how many consecutive Redis failures the background loops tolerate
     /// before shutting the runtime down. Defaults to 30.
+    ///
+    /// After a transient payload-read failure, preparation retries for up to
+    /// five seconds with backoff and jitter, retaining the claim and concurrency
+    /// permit. Other preparation failures, exhausted read retries, and uncertain
+    /// claims initiate shutdown regardless of this threshold. Redis may already
+    /// hold the claim, and a live runtime's heartbeat prevents its recovery.
+    /// Shutdown drains active handlers before stopping heartbeats; a peer or
+    /// replacement process can then resurrect eligible jobs. Applications must
+    /// handle [`Self::run`] returning an error and arrange a replacement when needed.
     pub fn redis_failure_tolerance(mut self, tolerance: u32) -> Self {
         self.settings.redis_failure_tolerance = tolerance;
         self

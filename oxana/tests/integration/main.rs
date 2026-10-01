@@ -1,4 +1,5 @@
 mod batch;
+mod claim_recovery;
 mod cron;
 mod dead;
 mod drain;

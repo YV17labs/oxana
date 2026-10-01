@@ -29,6 +29,7 @@ const JOB_EXPIRE_TIME: i64 = 7 * 24 * 3600; // 7 days
 const SCAN_BATCH_SIZE: usize = 500;
 const STATS_READ_BATCH_SIZE: usize = 500;
 const ENQUEUE_LIST_CHUNK_SIZE: usize = 100;
+const CLAIMED_JOB_READ_RETRY_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 enum UniqueCronAction {
@@ -598,6 +599,14 @@ impl StorageInternal {
 
     pub async fn dequeue(&self, queue: &str) -> Result<Option<JobId>, OxanaError> {
         let mut redis = self.connection().await?;
+        self.dequeue_w_conn(&mut redis, queue).await
+    }
+
+    pub(crate) async fn dequeue_w_conn(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        queue: &str,
+    ) -> Result<Option<JobId>, OxanaError> {
         let job_id: Option<JobId> = redis
             .lmove(
                 self.namespace_queue(queue),
@@ -607,6 +616,37 @@ impl StorageInternal {
             )
             .await?;
         Ok(job_id)
+    }
+
+    /// Retry transient payload reads while the caller retains the claim and permit.
+    /// The retry window starts after the first failure and is independent of
+    /// successful heartbeats or other operations resetting the failure counter.
+    pub async fn get_claimed_job(&self, id: &JobId) -> Result<Option<JobEnvelope>, OxanaError> {
+        let mut result = self.get_job(id).await;
+        let deadline = tokio::time::Instant::now() + CLAIMED_JOB_READ_RETRY_WINDOW;
+        let mut backoff_ms = 100_u64;
+        loop {
+            let error = match result {
+                Ok(envelope) => return Ok(envelope),
+                Err(error) if transient_payload_read_error(&error) => error,
+                Err(error) => return Err(error),
+            };
+            // Equal jitter keeps workers from retrying in lockstep, while a
+            // minimum delay limits Redis traffic even during a shared outage.
+            let half = backoff_ms / 2;
+            let delay_ms = half + uuid::Uuid::new_v4().as_u64_pair().1 % (half + 1);
+            tracing::warn!(job_id = id, error = %error, retry_in_ms = delay_ms, "Retrying claimed job payload read");
+            result = match tokio::time::timeout_at(deadline, async {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                self.get_job(id).await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return Err(error),
+            };
+            backoff_ms = (backoff_ms * 2).min(1000);
+        }
     }
 
     pub async fn get_job(&self, id: &JobId) -> Result<Option<JobEnvelope>, OxanaError> {
@@ -2255,6 +2295,25 @@ impl StorageInternal {
     }
 }
 
+fn transient_payload_read_error(error: &OxanaError) -> bool {
+    let error = match error {
+        OxanaError::DeadpoolRedisPoolError(deadpool_redis::PoolError::Timeout(_)) => return true,
+        OxanaError::DeadpoolRedisError(error)
+        | OxanaError::DeadpoolRedisPoolError(deadpool_redis::PoolError::Backend(error)) => error,
+        _ => return false,
+    };
+    error.is_io_error()
+        || matches!(
+            error.kind(),
+            redis::ErrorKind::Server(
+                redis::ServerErrorKind::BusyLoading
+                    | redis::ServerErrorKind::TryAgain
+                    | redis::ServerErrorKind::ClusterDown
+                    | redis::ServerErrorKind::MasterDown
+            )
+        )
+}
+
 fn redis_metric_increment(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -2272,6 +2331,59 @@ mod tests {
     struct TestJob {}
 
     impl crate::worker::Job for TestJob {}
+
+    #[tokio::test]
+    async fn claimed_payload_read_retries_pool_saturation() -> TestResult {
+        dotenvy::from_filename(".env.test").ok();
+        let storage = crate::Storage::builder()
+            .namespace(random_string())
+            .max_pool_size(1)
+            .timeouts(crate::StorageBuilderTimeouts {
+                wait: Some(Duration::from_millis(20)),
+                ..Default::default()
+            })
+            .build_from_redis_url(std::env::var("REDIS_URL")?)?
+            .internal;
+        let queue = random_string();
+        let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
+        storage.enqueue(envelope.clone()).await?;
+        assert_eq!(storage.dequeue(&queue).await?, Some(envelope.id.clone()));
+
+        let held_connection = storage.connection().await?;
+        let job_id = envelope.id.clone();
+        let read = storage.get_claimed_job(&job_id);
+        tokio::pin!(read);
+        assert!(read.as_mut().now_or_never().is_none());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(read.as_mut().now_or_never().is_none());
+        drop(held_connection);
+        let actual = tokio::time::timeout(Duration::from_secs(2), read)
+            .await??
+            .unwrap();
+        assert_eq!(actual.id, envelope.id);
+        assert_eq!(actual.meta.retries, 0);
+        let mut redis = storage.connection().await?;
+        let claimed: Vec<String> = redis
+            .lrange(storage.current_processing_queue(), 0, -1)
+            .await?;
+        assert_eq!(claimed, vec![envelope.id]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claimed_payload_read_does_not_retry_corrupt_json() -> TestResult {
+        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let job_id = random_string();
+        let mut redis = storage.connection().await?;
+        let _: () = redis
+            .hset(&storage.keys.jobs, &job_id, "invalid json")
+            .await?;
+        drop(redis);
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), storage.get_claimed_job(&job_id)).await?;
+        assert!(matches!(result, Err(OxanaError::JsonError(_))));
+        Ok(())
+    }
 
     /// The dead process threshold the resurrect tests sweep with.
     const DEAD_PROCESS_THRESHOLD: Duration = Duration::from_secs(5);
