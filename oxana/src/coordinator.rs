@@ -159,7 +159,14 @@ where
 {
     tracing::trace!("Processing job: {:?}", job_event);
 
-    let envelope: JobEnvelope = match config.storage.internal.get_job(&job_event.job_id).await {
+    let result = tokio::select! {
+        biased;
+        // Cancellation leaves the claim for ordinary shutdown recovery. It
+        // must not be treated as a missing payload and delete the job.
+        _ = config.cancel_token.cancelled() => return Ok(None),
+        result = config.storage.internal.get_claimed_job(&job_event.job_id) => result,
+    };
+    let envelope: JobEnvelope = match result {
         Ok(Some(envelope)) => envelope,
         Ok(None) => {
             tracing::warn!("Job {} not found", job_event.job_id);
@@ -847,6 +854,21 @@ mod tests {
         BatchItems,
     }
 
+    #[tokio::test]
+    async fn invalid_single_job_cleanup_error_is_propagated() -> TestResult {
+        invalid_job_cleanup_error(InvalidDispatch::Single).await
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_factory_cleanup_error_is_propagated() -> TestResult {
+        invalid_job_cleanup_error(InvalidDispatch::BatchFactory).await
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_items_cleanup_error_is_propagated() -> TestResult {
+        invalid_job_cleanup_error(InvalidDispatch::BatchItems).await
+    }
+
     async fn invalid_job_cleanup_error(dispatch: InvalidDispatch) -> TestResult {
         let pool = redis_pool().await?;
         let storage = Storage::builder()
@@ -915,21 +937,6 @@ mod tests {
         let retained: usize = redis.llen(processing.first().unwrap()).await?;
         assert_eq!(retained, count);
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn invalid_single_job_cleanup_error_is_propagated() -> TestResult {
-        invalid_job_cleanup_error(InvalidDispatch::Single).await
-    }
-
-    #[tokio::test]
-    async fn invalid_batch_factory_cleanup_error_is_propagated() -> TestResult {
-        invalid_job_cleanup_error(InvalidDispatch::BatchFactory).await
-    }
-
-    #[tokio::test]
-    async fn invalid_batch_items_cleanup_error_is_propagated() -> TestResult {
-        invalid_job_cleanup_error(InvalidDispatch::BatchItems).await
     }
 
     #[tokio::test]

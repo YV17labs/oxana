@@ -126,14 +126,6 @@ async fn pop_queue_message_wo_throttle(
     Ok(job_id)
 }
 
-async fn claim_job(storage: &StorageInternal, queue_key: &str) -> Result<Option<JobId>, PopError> {
-    let mut redis = storage.connection().await.map_err(PopError::BeforeClaim)?;
-    storage
-        .dequeue_w_conn(&mut redis, queue_key)
-        .await
-        .map_err(PopError::Claim)
-}
-
 async fn pop_queue_message_w_throttle(
     storage: &StorageInternal,
     queue_key: &str,
@@ -149,7 +141,7 @@ async fn pop_queue_message_w_throttle(
         && let Some(job_id) = claim_job(storage, queue_key).await?
     {
         let cost = storage
-            .get_job(&job_id)
+            .get_claimed_job(&job_id)
             .await
             .map_err(PopError::Claim)?
             .and_then(|envelope| envelope.meta.throttle_cost);
@@ -163,6 +155,14 @@ async fn pop_queue_message_w_throttle(
         .map_or(fallback_wait, Duration::from_millis);
     sleep(wait).await;
     Ok(None)
+}
+
+async fn claim_job(storage: &StorageInternal, queue_key: &str) -> Result<Option<JobId>, PopError> {
+    let mut redis = storage.connection().await.map_err(PopError::BeforeClaim)?;
+    storage
+        .dequeue_w_conn(&mut redis, queue_key)
+        .await
+        .map_err(PopError::Claim)
 }
 
 #[cfg(test)]
@@ -206,7 +206,10 @@ mod tests {
         let storage = Storage::builder()
             .namespace(random_string())
             .max_pool_size(1)
-            .timeouts(StorageBuilderTimeouts::new(Duration::from_millis(20)))
+            .timeouts(StorageBuilderTimeouts {
+                wait: Some(Duration::from_millis(20)),
+                ..Default::default()
+            })
             .build_from_redis_url(std::env::var("REDIS_URL")?)?;
         let envelope = crate::JobEnvelope::new(queue.clone(), TestJob)?;
         storage.internal.enqueue(envelope.clone()).await?;
